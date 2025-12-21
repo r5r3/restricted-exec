@@ -9,6 +9,12 @@ use std::ffi::{CStr, CString, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
+const DEFAULT_LIB_DIRS: [&str; 6] = [
+    "/lib", "/lib64", "/usr/lib", "/usr/lib64", "/usr/local/lib", "/usr/local/lib64",
+];
+const LD_SO_PATHS: [&str; 3] = ["/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d"];
+
+
 #[derive(Parser, Debug)]
 #[command(
     name = "locked-run-as-user",
@@ -121,23 +127,11 @@ fn main() -> Result<()> {
     }
 
     // --default-libs: add a minimal set of common glibc/ld.so locations.
-    // These are "best effort": missing paths are ignored.
     if args.default_libs {
-        // Common library roots (also covers the dynamic loader on most distros).
-        // Use RO+X so the loader can be executed even if it lives under these trees.
-        for p in [
-            "/lib",
-            "/lib64",
-            "/usr/lib",
-            "/usr/lib64",
-            "/usr/local/lib",
-            "/usr/local/lib64",
-        ] {
+        for p in DEFAULT_LIB_DIRS {
             add_allow_path(&mut allow, PathBuf::from(p), access_rox, false)?;
         }
-
-        // ld.so configuration files/directories are read by the loader.
-        for p in ["/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d"] {
+        for p in LD_SO_PATHS {
             add_allow_path(&mut allow, PathBuf::from(p), access_ro, false)?;
         }
     }
@@ -159,7 +153,7 @@ fn main() -> Result<()> {
         let used = resolve_used_shared_objects(&trace_prog, &trace_argv)
             .context("failed to resolve used shared libraries")?;
 
-        for p in ["/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d"] {
+        for p in LD_SO_PATHS {
             add_allow_path(&mut allow, PathBuf::from(p), access_ro, false)?;
         }
 
