@@ -298,36 +298,6 @@ fn resolve_used_shared_objects(prog: &Path, argv: &[OsString]) -> Result<Vec<Pat
     Ok(canon)
 }
 
-// Allow a file read-only AND ensure ancestor directories are traversable.
-fn add_allow_file_with_ancestors(
-    map: &mut BTreeMap<PathBuf, BitFlags<AccessFs>>,
-    file: &Path,
-    file_access: BitFlags<AccessFs>,
-) -> Result<()> {
-    // Require existing file.
-    std::fs::metadata(file)
-        .with_context(|| format!("resolved library does not exist: {}", file.display()))?;
-
-    let file = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
-    map.entry(file.clone())
-        .and_modify(|a| *a |= file_access)
-        .or_insert(file_access);
-
-    // Allow traversal of ancestors (ReadDir) so opening the file by path works.
-    let dir_access = make_bitflags!(AccessFs::{ ReadDir });
-    let mut cur = file.parent();
-
-    while let Some(dir) = cur {
-        map.entry(dir.to_path_buf())
-            .and_modify(|a| *a |= dir_access)
-            .or_insert(dir_access);
-
-        cur = dir.parent();
-    }
-
-    Ok(())
-}
-
 fn add_allow_path(
     map: &mut BTreeMap<PathBuf, BitFlags<AccessFs>>,
     path: PathBuf,
