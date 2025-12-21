@@ -13,4 +13,5 @@ clap = { version = "4", features = ["derive"] }
 landlock = "0.4"
 libc = "0.2"
 goblin = "0.8"
+libseccomp = "0.4.0"
 

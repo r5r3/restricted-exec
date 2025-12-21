@@ -8,6 +8,8 @@ use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use libseccomp::{ScmpAction, ScmpFilterContext, ScmpSyscall};
+
 
 const DEFAULT_LIB_DIRS: [&str; 6] = [
     "/lib", "/lib64", "/usr/lib", "/usr/lib64", "/usr/local/lib", "/usr/local/lib64",
@@ -53,6 +55,14 @@ struct Args {
     /// Allow common NSS config files in /etc and libnss_* modules (for username/group lookups).
     #[arg(long)]
     allow_nss: bool,
+
+    /// Drop Linux capabilities (bounding set + ambient + effective/permitted/inheritable).
+    #[arg(long)]
+    drop_caps: bool,
+
+    /// Install a seccomp filter that blocks mount-related syscalls (and namespace helpers).
+    #[arg(long)]
+    seccomp_mount: bool,
 
     /// Print the final allowlist (paths + rights) before enforcing Landlock.
     #[arg(long)]
@@ -192,6 +202,19 @@ fn main() -> Result<()> {
         RulesetStatus::NotEnforced => {
             bail!("Landlock is not enforced on this system: {:?}", status);
         }
+    }
+
+    // Optional hardening layers (must happen before dropping uid/gid).
+    if args.drop_caps || args.seccomp_mount {
+        set_no_new_privs().context("failed to set no_new_privs")?;
+    }
+
+    if args.drop_caps {
+        drop_caps().context("failed to drop capabilities")?;
+    }
+
+    if args.seccomp_mount {
+        install_seccomp_mount().context("failed to install seccomp mount filter")?;
     }
 
     // Drop privileges (if requested) AFTER Landlock is enforced.
@@ -717,4 +740,196 @@ fn execv(cmd: &Path, argv: &[OsString]) -> Result<()> {
 
     Err(std::io::Error::last_os_error()).context("execv failed")
 }
+
+fn set_no_new_privs() -> Result<()> {
+    // PR_SET_NO_NEW_PRIVS = 38 on Linux; libc usually defines it.
+    let rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).context("prctl(PR_SET_NO_NEW_PRIVS) failed");
+    }
+    Ok(())
+}
+
+fn read_last_cap() -> u32 {
+    // Kernel exposes last capability index here.
+    // If not readable, fall back to a conservative value.
+    std::fs::read_to_string("/proc/sys/kernel/cap_last_cap")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(63)
+}
+
+fn have_cap_in_effective(cap: u32) -> Result<bool> {
+    // Linux capability API v3
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
+
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    let mut hdr = CapHeader { version: LINUX_CAPABILITY_VERSION_3, pid: 0 };
+    let mut data = [CapData { effective: 0, permitted: 0, inheritable: 0 },
+                    CapData { effective: 0, permitted: 0, inheritable: 0 }];
+
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            &mut hdr as *mut CapHeader,
+            data.as_mut_ptr(),
+        )
+    };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).context("SYS_capget failed");
+    }
+
+    let idx = (cap / 32) as usize;
+    let bit = 1u32 << (cap % 32);
+    if idx >= data.len() {
+        return Ok(false);
+    }
+    Ok((data[idx].effective & bit) != 0)
+}
+
+fn drop_caps() -> Result<()> {
+    const CAP_SETPCAP: u32 = 8;
+
+    // 2) Clear ambient caps (best-effort; older kernels may ENOSYS). :contentReference[oaicite:1]{index=1}
+    let rc = unsafe {
+        libc::prctl(
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0, 0, 0,
+        )
+    };
+    if rc != 0 {
+        let e = std::io::Error::last_os_error();
+        if e.raw_os_error() != Some(libc::ENOSYS) {
+            return Err(e).context("prctl(PR_CAP_AMBIENT_CLEAR_ALL) failed");
+        }
+    }
+
+    // 3) Clear effective/permitted/inheritable sets for self.
+    clear_capsets().context("capset clear failed")?;
+
+    // 1) Drop bounding-set caps only if we have CAP_SETPCAP; otherwise skip with warning.
+    // PR_CAPBSET_DROP requires CAP_SETPCAP. :contentReference[oaicite:2]{index=2}
+    let can_drop_bset = have_cap_in_effective(CAP_SETPCAP)?;
+    if !can_drop_bset {
+        eprintln!("warning: --drop-caps: CAP_SETPCAP not in effective set; skipping PR_CAPBSET_DROP (bounding set)");
+        return Ok(());
+    }
+
+    let last = read_last_cap();
+    for cap in 0..=last {
+        let rc = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong) };
+        if rc != 0 {
+            let e = std::io::Error::last_os_error();
+            // If we lost CAP_SETPCAP mid-way (or policy blocks it), stop and warn.
+            if e.raw_os_error() == Some(libc::EPERM) {
+                eprintln!(
+                    "warning: --drop-caps: PR_CAPBSET_DROP({}) EPERM; stopping bounding-set drops",
+                    cap
+                );
+                break;
+            }
+            return Err(e).with_context(|| format!("prctl(PR_CAPBSET_DROP, {}) failed", cap));
+        }
+    }
+
+    Ok(())
+}
+
+fn clear_capsets() -> Result<()> {
+    // Linux capability API v3 (64-bit caps in data[0] and data[1])
+    const _LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
+
+    #[repr(C)]
+    struct __user_cap_header_struct {
+        version: u32,
+        pid: i32,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct __user_cap_data_struct {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+
+    let mut hdr = __user_cap_header_struct {
+        version: _LINUX_CAPABILITY_VERSION_3,
+        pid: 0, // self
+    };
+
+    let data = [
+        __user_cap_data_struct { effective: 0, permitted: 0, inheritable: 0 },
+        __user_cap_data_struct { effective: 0, permitted: 0, inheritable: 0 },
+    ];
+
+    // capset is a syscall; use libc::syscall. :contentReference[oaicite:9]{index=9}
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_capset,
+            &mut hdr as *mut __user_cap_header_struct,
+            data.as_ptr(),
+        )
+    };
+
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error()).context("SYS_capset failed");
+    }
+
+    Ok(())
+}
+
+fn install_seccomp_mount() -> Result<()> {
+    // Default: allow everything, deny a small set.
+    let mut filter = ScmpFilterContext::new(ScmpAction::Allow)
+        .context("ScmpFilterContext::new failed")?;
+
+    let deny = ScmpAction::Errno(libc::EPERM);
+
+    // Core mount syscalls + the newer mount API.
+    // (This is intentionally minimal; add more if you want tighter sandboxing.)
+    let syscalls = [
+        "mount",
+        "umount2",
+        "pivot_root",
+        "open_tree",
+        "move_mount",
+        "fsopen",
+        "fsconfig",
+        "fsmount",
+        "mount_setattr",
+    ];
+
+    for name in syscalls {
+        if let Ok(sc) = ScmpSyscall::from_name(name) {
+            filter.add_rule(deny, sc).with_context(|| format!("seccomp add_rule({}) failed", name))?;
+        }
+        // If a syscall doesn't exist on this arch/kernel, just skip it.
+    }
+
+    // Optional hardening: prevent creating/entering namespaces used for mounting.
+    for name in ["unshare", "setns"] {
+        if let Ok(sc) = ScmpSyscall::from_name(name) {
+            filter.add_rule(deny, sc).with_context(|| format!("seccomp add_rule({}) failed", name))?;
+        }
+    }
+
+    filter.load().context("seccomp load failed")?;
+    Ok(())
+}
+
 
