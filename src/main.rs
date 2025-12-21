@@ -40,6 +40,14 @@ struct Args {
     #[arg(long)]
     libs: bool,
 
+    /// Resolve actually used shared libraries (ldd-style) and allowlist them explicitly.
+    #[arg(long)]
+    resolve_libs: bool,
+
+    /// Print the final allowlist (paths + rights) before enforcing Landlock.
+    #[arg(long)]
+    debug: bool,
+
     /// Command to execute (use `--` to separate it from launcher options).
     #[arg(value_name = "CMD", required = true)]
     cmd: Vec<OsString>,
@@ -134,6 +142,41 @@ fn main() -> Result<()> {
         }
     }
 
+    if args.resolve_libs {
+        let (trace_prog, trace_argv) = build_trace_command(&cmd_path, &cmd_argv)?;
+
+        // 1) Allow the ELF interpreter for the traced program (dynamic loader), if any.
+        if let Some(interp) = elf_interpreter(&trace_prog)? {
+            add_allow_path(
+                &mut allow,
+                interp,
+                make_bitflags!(AccessFs::{ Execute | ReadFile }),
+                true,
+            )?;
+        }
+
+        // 2) Resolve actual libs and allow them read-only.
+        let used = resolve_used_shared_objects(&trace_prog, &trace_argv)
+            .context("failed to resolve used shared libraries")?;
+
+        for p in ["/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d"] {
+            add_allow_path(&mut allow, PathBuf::from(p), access_ro, false)?;
+        }
+
+        for so in used {
+            add_allow_path(
+                &mut allow,
+                so,
+                make_bitflags!(AccessFs::{ ReadFile }),
+                true,
+            )?;
+        }
+    }
+
+    if args.debug {
+        debug_dump_allowlist(&allow);
+    }
+
     // Build + enforce the Landlock ruleset.
     let status = enforce_landlock(abi, &allow).context("failed to enforce Landlock")?;
     match status.ruleset {
@@ -158,6 +201,133 @@ fn main() -> Result<()> {
     execv(&cmd_path, &cmd_argv)
 }
 
+fn build_trace_command(cmd_path: &Path, cmd_argv: &[OsString]) -> Result<(PathBuf, Vec<OsString>)> {
+    // If cmd is a script with shebang, the kernel actually executes the interpreter.
+    // To match runtime behavior, trace the interpreter with argv = [interp, script, args...].
+    if let Some(interp) = shebang_interpreter(cmd_path)? {
+        let mut argv: Vec<OsString> = Vec::with_capacity(cmd_argv.len() + 1);
+        argv.push(interp.as_os_str().to_os_string()); // argv[0] = interpreter
+        argv.push(cmd_path.as_os_str().to_os_string()); // argv[1] = script path
+        argv.extend_from_slice(&cmd_argv[1..]); // rest
+        Ok((interp, argv))
+    } else {
+        Ok((cmd_path.to_path_buf(), cmd_argv.to_vec()))
+    }
+}
+
+fn elf_interpreter(path: &Path) -> Result<Option<PathBuf>> {
+    use goblin::elf::Elf;
+    use std::fs;
+
+    let data = fs::read(path)?;
+    match Elf::parse(&data) {
+        Ok(elf) => Ok(elf.interpreter.map(PathBuf::from)),
+        Err(_) => Ok(None), // not an ELF (might be script), ignore
+    }
+}
+
+fn resolve_used_shared_objects(prog: &Path, argv: &[OsString]) -> Result<Vec<PathBuf>> {
+    // This is essentially what ldd does: run the dynamic loader in trace mode.
+    // Safe enough here because you only run trusted executables.
+    let mut cmd = std::process::Command::new(prog);
+    cmd.args(&argv[1..]);
+    cmd.env("LD_TRACE_LOADED_OBJECTS", "1");
+    // Optional but often useful to avoid surprises:
+    // cmd.env("LD_BIND_NOW", "1");
+
+    let out = cmd.output().with_context(|| format!("failed to execute trace for {}", prog.display()))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        bail!(
+            "library trace failed (exit {}):\nstdout:\n{}\nstderr:\n{}",
+            out.status, stdout, stderr
+        );
+    }
+
+    let mut paths: Vec<PathBuf> = Vec::new();
+    let text = {
+        let mut t = String::new();
+        t.push_str(&String::from_utf8_lossy(&out.stdout));
+        t.push('\n');
+        t.push_str(&String::from_utf8_lossy(&out.stderr));
+        t
+    };
+
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+
+        // Common ldd/trace formats:
+        //   libc.so.6 => /lib/x86_64-linux-gnu/libc.so.6 (0x...)
+        //   /lib64/ld-linux-x86-64.so.2 (0x...)
+        //   linux-vdso.so.1 (0x...)   [ignore: not a real filesystem path]
+        if let Some(idx) = line.find("=>") {
+            let rhs = line[idx + 2..].trim();
+            if rhs.starts_with("not found") {
+                continue;
+            }
+            // Take the first whitespace-delimited token after =>
+            if let Some(tok) = rhs.split_whitespace().next() {
+                if tok.starts_with('/') {
+                    paths.push(PathBuf::from(tok));
+                }
+            }
+        } else {
+            // Take the first token; if it’s an absolute path, keep it.
+            if let Some(tok) = line.split_whitespace().next() {
+                if tok.starts_with('/') {
+                    paths.push(PathBuf::from(tok));
+                }
+            }
+        }
+    }
+
+    // Canonicalize + dedup (best effort).
+    let mut canon: Vec<PathBuf> = Vec::new();
+    for p in paths {
+        let p = std::fs::canonicalize(&p).unwrap_or(p);
+        if std::fs::metadata(&p).is_ok() {
+            canon.push(p);
+        }
+    }
+    canon.sort();
+    canon.dedup();
+    Ok(canon)
+}
+
+// Allow a file read-only AND ensure ancestor directories are traversable.
+fn add_allow_file_with_ancestors(
+    map: &mut BTreeMap<PathBuf, BitFlags<AccessFs>>,
+    file: &Path,
+    file_access: BitFlags<AccessFs>,
+) -> Result<()> {
+    // Require existing file.
+    std::fs::metadata(file)
+        .with_context(|| format!("resolved library does not exist: {}", file.display()))?;
+
+    let file = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+    map.entry(file.clone())
+        .and_modify(|a| *a |= file_access)
+        .or_insert(file_access);
+
+    // Allow traversal of ancestors (ReadDir) so opening the file by path works.
+    let dir_access = make_bitflags!(AccessFs::{ ReadDir });
+    let mut cur = file.parent();
+
+    while let Some(dir) = cur {
+        map.entry(dir.to_path_buf())
+            .and_modify(|a| *a |= dir_access)
+            .or_insert(dir_access);
+
+        cur = dir.parent();
+    }
+
+    Ok(())
+}
+
 fn add_allow_path(
     map: &mut BTreeMap<PathBuf, BitFlags<AccessFs>>,
     path: PathBuf,
@@ -176,6 +346,13 @@ fn add_allow_path(
         .and_modify(|a| *a |= access)
         .or_insert(access);
     Ok(())
+}
+
+fn debug_dump_allowlist(allow: &BTreeMap<PathBuf, BitFlags<AccessFs>>) {
+    eprintln!("locked-run-as-user: allowed paths ({} entries):", allow.len());
+    for (p, a) in allow.iter() {
+        eprintln!("  {:?}  {}", a, p.display());
+    }
 }
 
 fn enforce_landlock(abi: ABI, allow: &BTreeMap<PathBuf, BitFlags<AccessFs>>) -> Result<landlock::RestrictionStatus> {
