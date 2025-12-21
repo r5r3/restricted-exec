@@ -1,0 +1,15 @@
+[package]
+name = "locked-run-as-user"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "locked-run-as-user"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+landlock = "0.4"
+libc = "0.2"
+
