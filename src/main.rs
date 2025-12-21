@@ -38,7 +38,7 @@ struct Args {
 
     /// Add a small set of common runtime paths for dynamically linked executables.
     #[arg(long)]
-    libs: bool,
+    default_libs: bool,
 
     /// Resolve actually used shared libraries (ldd-style) and allowlist them explicitly.
     #[arg(long)]
@@ -120,9 +120,9 @@ fn main() -> Result<()> {
         )?;
     }
 
-    // --libs: add a minimal set of common glibc/ld.so locations.
+    // --default-libs: add a minimal set of common glibc/ld.so locations.
     // These are "best effort": missing paths are ignored.
-    if args.libs {
+    if args.default_libs {
         // Common library roots (also covers the dynamic loader on most distros).
         // Use RO+X so the loader can be executed even if it lives under these trees.
         for p in [
@@ -298,6 +298,45 @@ fn resolve_used_shared_objects(prog: &Path, argv: &[OsString]) -> Result<Vec<Pat
     Ok(canon)
 }
 
+fn merge_allow(
+    map: &mut BTreeMap<PathBuf, BitFlags<AccessFs>>,
+    path: PathBuf,
+    access: BitFlags<AccessFs>,
+) {
+    map.entry(path)
+        .and_modify(|a| *a |= access)
+        .or_insert(access);
+}
+
+// Lexical normalization for paths that might not exist (does not resolve symlinks).
+fn clean_path(p: &Path) -> PathBuf {
+    use std::path::{Component, PathBuf};
+
+    let mut out = PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                // Pop only if possible; for absolute paths this is safe
+                // (won't go above root).
+                out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn normalize_path(p: &Path) -> PathBuf {
+    // If it exists, canonicalize (removes symlinks, ., .., etc.)
+    // Otherwise, do a lexical cleanup.
+    if std::fs::metadata(p).is_ok() {
+        std::fs::canonicalize(p).unwrap_or_else(|_| clean_path(p))
+    } else {
+        clean_path(p)
+    }
+}
+
 fn add_allow_path(
     map: &mut BTreeMap<PathBuf, BitFlags<AccessFs>>,
     path: PathBuf,
@@ -308,13 +347,15 @@ fn add_allow_path(
         std::fs::metadata(&path)
             .with_context(|| format!("path does not exist: {}", path.display()))?;
     } else if std::fs::metadata(&path).is_err() {
-        // best-effort: ignore missing paths for --libs
+        // best-effort: ignore missing paths (e.g. optional --libs entries)
         return Ok(());
     }
 
-    map.entry(path)
-        .and_modify(|a| *a |= access)
-        .or_insert(access);
+    let p = normalize_path(&path);
+
+    // Add the path itself (merged).
+    merge_allow(map, p.clone(), access);
+
     Ok(())
 }
 
