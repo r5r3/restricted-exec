@@ -50,6 +50,10 @@ struct Args {
     #[arg(long)]
     resolve_libs: bool,
 
+    /// Allow common NSS config files in /etc and libnss_* modules (for username/group lookups).
+    #[arg(long)]
+    allow_nss: bool,
+
     /// Print the final allowlist (paths + rights) before enforcing Landlock.
     #[arg(long)]
     debug: bool,
@@ -165,6 +169,10 @@ fn main() -> Result<()> {
                 true,
             )?;
         }
+    }
+
+    if args.allow_nss {
+        add_allow_nss(&mut allow, access_ro).context("failed to add NSS allowlist")?;
     }
 
     if args.debug {
@@ -349,6 +357,77 @@ fn add_allow_path(
 
     // Add the path itself (merged).
     merge_allow(map, p.clone(), access);
+
+    Ok(())
+}
+
+fn add_allow_nss(
+    allow: &mut BTreeMap<PathBuf, BitFlags<AccessFs>>,
+    access_ro: BitFlags<AccessFs>,
+) -> Result<()> {
+    // Common NSS-related configuration / databases (best-effort: some may not exist).
+    // This covers typical user/group lookups and also common network-related NSS lookups.
+    const ETC_FILES: &[&str] = &[
+        "/etc/nsswitch.conf",
+        "/etc/passwd",
+        "/etc/group",
+        "/etc/shadow",
+        "/etc/gshadow",
+        "/etc/hosts",
+        "/etc/resolv.conf",
+        "/etc/host.conf",
+        "/etc/services",
+        "/etc/protocols",
+        "/etc/networks",
+    ];
+
+    for p in ETC_FILES {
+        add_allow_path(allow, PathBuf::from(p), access_ro, false)?;
+    }
+
+    // SSSD client-side caches / IPC.
+    // - /var/lib/sss/mc/*: fast memcache files used by libnss_sss unless disabled via
+    //   SSS_NSS_USE_MEMCACHE=NO.
+    // - /var/lib/sss/pipes/*: responder sockets ("pipes") used for NSS queries.
+    for p in [
+        "/var/lib/sss/mc/passwd",
+        "/var/lib/sss/mc/group",
+        "/var/lib/sss/pipes/nss",
+    ] {
+        add_allow_path(allow, PathBuf::from(p), access_ro, false)?;
+    }
+
+    // NSS modules are typically loaded via dlopen() (not necessarily present in ldd output),
+    // so we add any libnss_* found in common library directories.
+    const LIB_DIRS: &[&str] = &[
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/lib/x86_64-linux-gnu",
+        "/usr/lib/x86_64-linux-gnu",
+        "/lib/aarch64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
+    ];
+
+    // libs only need to be readable (no Execute required for .so).
+    let ro_file = make_bitflags!(AccessFs::{ ReadFile });
+
+    for d in LIB_DIRS {
+        let dir = Path::new(d);
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+
+        for entry in rd.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+
+            // Match libnss_*.so*
+            if name.starts_with("libnss_") && name.contains(".so") {
+                // entry exists, so must_exist=true is fine.
+                add_allow_path(allow, path, ro_file, true)?;
+            }
+        }
+    }
 
     Ok(())
 }
