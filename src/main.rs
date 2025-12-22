@@ -19,7 +19,7 @@ const LD_SO_PATHS: [&str; 3] = ["/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "locked-run-as-user",
+    name = "restricted-exec",
     about = "Run a command as another user with a Landlock filesystem allowlist",
     trailing_var_arg = true
 )]
@@ -456,7 +456,7 @@ fn add_allow_nss(
 }
 
 fn debug_dump_allowlist(allow: &BTreeMap<PathBuf, BitFlags<AccessFs>>) {
-    eprintln!("locked-run-as-user: allowed paths ({} entries):", allow.len());
+    eprintln!("restricted-exec: allowed paths ({} entries):", allow.len());
     for (p, a) in allow.iter() {
         eprintln!("  {:?}  {}", a, p.display());
     }

@@ -1,10 +1,10 @@
 [package]
-name = "locked-run-as-user"
+name = "restricted-exec"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "locked-run-as-user"
+name = "restricted-exec"
 path = "src/main.rs"
 
 [dependencies]
@@ -12,6 +12,6 @@ anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 landlock = "0.4"
 libc = "0.2"
-goblin = "0.8"
+goblin = "0.10"
 libseccomp = "0.4.0"
 
