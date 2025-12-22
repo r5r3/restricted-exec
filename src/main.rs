@@ -4,8 +4,9 @@ use landlock::{
     make_bitflags, Access, AccessFs, BitFlags, PathBeneath, PathFd, Ruleset, RulesetAttr,
     RulesetCreatedAttr, RulesetStatus, ABI,
 };
-use libseccomp::{ScmpAction, ScmpFilterContext, ScmpSyscall};
+use libseccomp::{ScmpAction, ScmpArgCompare, ScmpCompareOp, ScmpFilterContext, ScmpSyscall};
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::ffi::{CStr, CString, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
@@ -22,6 +23,85 @@ const DEFAULT_LIB_DIRS: [&str; 6] = [
     "/usr/local/lib64",
 ];
 const LD_SO_PATHS: [&str; 3] = ["/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d"];
+
+// Seccomp syscall lists.
+// Use "@default" / "@mount" on the CLI to refer to these lists.
+const SECCOMP_LIST_DEFAULT: &[&str] = &[
+    // Docker “significant blocked syscalls” (docs list)
+    "acct",
+    "add_key",
+    "bpf",
+    "clock_adjtime",
+    "clock_settime",
+    "create_module",
+    "delete_module",
+    "finit_module",
+    "get_kernel_syms",
+    "get_mempolicy",
+    "init_module",
+    "ioperm",
+    "iopl",
+    "kcmp",
+    "kexec_file_load",
+    "kexec_load",
+    "keyctl",
+    "lookup_dcookie",
+    "mbind",
+    "mount",
+    "move_pages",
+    "nfsservctl",
+    "open_by_handle_at",
+    "perf_event_open",
+    "pivot_root",
+    "process_vm_readv",
+    "process_vm_writev",
+    "ptrace",
+    "query_module",
+    "quotactl",
+    "reboot",
+    "request_key",
+    "set_mempolicy",
+    "setns",
+    "settimeofday",
+    "stime",
+    "swapon",
+    "swapoff",
+    "sysfs",
+    "_sysctl",
+    "umount",
+    "umount2",
+    "unshare",
+    "uselib",
+    "userfaultfd",
+    "ustat",
+    "vm86",
+    "vm86old",
+
+    // “Docker-like” special-cased rules (conditional deny, not unconditional):
+    "clone",
+    "personality",
+];
+
+// Mount-related syscalls (plus namespace helpers commonly used to mount).
+const SECCOMP_LIST_MOUNT: &[&str] = &[
+    "mount",
+    "umount",
+    "umount2",
+    "pivot_root",
+    // New mount API:
+    "open_tree",
+    "move_mount",
+    "fsopen",
+    "fsconfig",
+    "fsmount",
+    "mount_setattr",
+    // Namespace helpers relevant to mounting:
+    "unshare",
+    "setns",
+    // If requested, we apply the *conditional* rule for namespace clone flags:
+    "clone",
+];
+
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy)]
 enum LogLevel {
@@ -73,9 +153,22 @@ struct Args {
     #[arg(long)]
     drop_caps: bool,
 
-    /// Install a seccomp filter that blocks mount-related syscalls (and namespace helpers).
+    /// Seccomp blocklist items: syscall names and/or list names prefixed with '@'.
+    /// Examples: --seccomp-filter @default
+    ///           --seccomp-filter @mount --seccomp-filter keyctl
+    #[arg(long, value_name = "ITEM", action = ArgAction::Append)]
+    seccomp_filter: Vec<String>,
+
+    /// Seccomp allow items: remove entries from the effective blocklist.
+    /// Accepts syscall names and/or list names prefixed with '@'.
+    /// Example: --seccomp-allow mount --seccomp-allow @mount
+    #[arg(long, value_name = "ITEM", action = ArgAction::Append)]
+    seccomp_allow: Vec<String>,
+
+    /// Allow the executed program to gain new privileges via exec (setuid/setgid/file caps).
+    /// By default, restricted-exec sets no_new_privs=1, which will break helpers like fusermount3/sshfs.
     #[arg(long)]
-    seccomp_mount: bool,
+    allow_new_privs: bool,
 
     /// Log level for restricted-exec (warn, info, debug). Can still be overridden by RUST_LOG.
     #[arg(long, value_enum, default_value_t = LogLevel::Warn)]
@@ -111,6 +204,18 @@ fn init_tracing(level: LogLevel) {
         .init();
 }
 
+fn landlock_requested(args: &Args) -> bool {
+    // Only enable Landlock if the user provided any path restriction inputs.
+    // (If you later add more allowlist-related flags, include them here.)
+    !args.ro.is_empty()
+        || !args.rox.is_empty()
+        || !args.rw.is_empty()
+        || !args.rwx.is_empty()
+        || args.default_libs
+        || args.resolve_libs
+        || args.allow_nss
+}
+
 fn main() {
     let args = Args::parse();
     init_tracing(args.log_level);
@@ -136,71 +241,40 @@ fn run(args: Args) -> Result<()> {
 
     debug!(cmd = %cmd_path.display(), argc = cmd_argv.len(), "resolved command");
 
-    // Choose an ABI "ceiling". Best-effort will degrade on older kernels by default.
-    let abi = ABI::V6;
-
-    // Access sets implementing your CLI semantics (note: AccessFs::from_write contains a broad set
-    // of "write-ish" operations like create/remove/rename/truncate depending on ABI). 
-    let access_ro: BitFlags<AccessFs> = make_bitflags!(AccessFs::{ ReadFile | ReadDir });
-    let access_rox: BitFlags<AccessFs> = access_ro | AccessFs::Execute;
-    let access_rw: BitFlags<AccessFs> = access_ro | AccessFs::from_write(abi);
-    let access_rwx: BitFlags<AccessFs> = access_rw | AccessFs::Execute;
-
-    // Collect and merge rules by (path -> union of requested rights).
-    // BTreeMap gives deterministic ordering.
     let mut allow: BTreeMap<PathBuf, BitFlags<AccessFs>> = BTreeMap::new();
+    if landlock_requested(&args) {
+        // Choose an ABI "ceiling".
+        let abi = ABI::V6;
 
-    // User-specified rules must exist.
-    for p in args.ro {
-        add_allow_path(&mut allow, p, access_ro, true)?;
-    }
-    for p in args.rox {
-        add_allow_path(&mut allow, p, access_rox, true)?;
-    }
-    for p in args.rw {
-        add_allow_path(&mut allow, p, access_rw, true)?;
-    }
-    for p in args.rwx {
-        add_allow_path(&mut allow, p, access_rwx, true)?;
-    }
+        let access_ro: BitFlags<AccessFs> = make_bitflags!(AccessFs::{ ReadFile | ReadDir });
+        let access_rox: BitFlags<AccessFs> = access_ro | AccessFs::Execute;
+        let access_rw: BitFlags<AccessFs> = access_ro | AccessFs::from_write(abi);
+        let access_rwx: BitFlags<AccessFs> = access_rw | AccessFs::Execute;
 
-    // Always allow executing the command itself (file rule).
-    add_allow_path(
-        &mut allow,
-        cmd_path.clone(),
-        make_bitflags!(AccessFs::{ Execute | ReadFile }),
-        true,
-    )?;
+        // User-specified rules must exist.
+        for p in args.ro.clone() {
+            add_allow_path(&mut allow, p, access_ro, true)?;
+        }
+        for p in args.rox.clone() {
+            add_allow_path(&mut allow, p, access_rox, true)?;
+        }
+        for p in args.rw.clone() {
+            add_allow_path(&mut allow, p, access_rw, true)?;
+        }
+        for p in args.rwx.clone() {
+            add_allow_path(&mut allow, p, access_rwx, true)?;
+        }
 
-    // If it's a script with #! shebang, allow executing the interpreter too.
-    if let Some(interp) = shebang_interpreter(&cmd_path)? {
-        debug!(interp = %interp.display(), "detected shebang interpreter");
+        // Always allow executing the command itself.
         add_allow_path(
             &mut allow,
-            interp,
+            cmd_path.clone(),
             make_bitflags!(AccessFs::{ Execute | ReadFile }),
             true,
         )?;
-    }
 
-    // --default-libs: add a minimal set of common glibc/ld.so locations.
-    if args.default_libs {
-        info!("adding default library paths");
-        for p in DEFAULT_LIB_DIRS {
-            add_allow_path(&mut allow, PathBuf::from(p), access_rox, false)?;
-        }
-        for p in LD_SO_PATHS {
-            add_allow_path(&mut allow, PathBuf::from(p), access_ro, false)?;
-        }
-    }
-
-    if args.resolve_libs {
-        info!("resolving used shared objects (ldd-style trace)");
-        let (trace_prog, trace_argv) = build_trace_command(&cmd_path, &cmd_argv)?;
-
-        // 1) Allow the ELF interpreter for the traced program (dynamic loader), if any.
-        if let Some(interp) = elf_interpreter(&trace_prog)? {
-            debug!(loader = %interp.display(), "ELF interpreter (dynamic loader)");
+        // If it's a script with #! shebang, allow executing the interpreter too.
+        if let Some(interp) = shebang_interpreter(&cmd_path)? {
             add_allow_path(
                 &mut allow,
                 interp,
@@ -209,51 +283,65 @@ fn run(args: Args) -> Result<()> {
             )?;
         }
 
-        // 2) Resolve actual libs and allow them read-only.
-        let used = resolve_used_shared_objects(&trace_prog, &trace_argv)
-            .context("failed to resolve used shared libraries")?;
-
-        for p in LD_SO_PATHS {
-            add_allow_path(&mut allow, PathBuf::from(p), access_ro, false)?;
+        if args.default_libs {
+            for p in DEFAULT_LIB_DIRS {
+                add_allow_path(&mut allow, PathBuf::from(p), access_rox, false)?;
+            }
+            for p in LD_SO_PATHS {
+                add_allow_path(&mut allow, PathBuf::from(p), access_ro, false)?;
+            }
         }
 
-        debug!(count = used.len(), "resolved shared object paths");
-        for so in used {
-            add_allow_path(
-                &mut allow,
-                so,
-                make_bitflags!(AccessFs::{ ReadFile }),
-                true,
-            )?;
+        if args.resolve_libs {
+            let (trace_prog, trace_argv) = build_trace_command(&cmd_path, &cmd_argv)?;
+
+            if let Some(interp) = elf_interpreter(&trace_prog)? {
+                add_allow_path(
+                    &mut allow,
+                    interp,
+                    make_bitflags!(AccessFs::{ Execute | ReadFile }),
+                    true,
+                )?;
+            }
+
+            let used = resolve_used_shared_objects(&trace_prog, &trace_argv)
+                .context("failed to resolve used shared libraries")?;
+
+            for p in LD_SO_PATHS {
+                add_allow_path(&mut allow, PathBuf::from(p), access_ro, false)?;
+            }
+            for so in used {
+                add_allow_path(&mut allow, so, make_bitflags!(AccessFs::{ ReadFile }), true)?;
+            }
         }
+
+        if args.allow_nss {
+            add_allow_nss(&mut allow, access_ro).context("failed to add NSS allowlist")?;
+        }
+
+        if matches!(args.log_level, LogLevel::Debug) {
+            debug_dump_allowlist(&allow);
+        }
+
+        // Enforce Landlock *only* when requested.
+        tracing::info!(entries = allow.len(), "enforcing Landlock ruleset");
+        let status = enforce_landlock(abi, &allow).context("failed to enforce Landlock")?;
+        match status.ruleset {
+            RulesetStatus::FullyEnforced => tracing::info!("Landlock fully enforced"),
+            RulesetStatus::PartiallyEnforced => tracing::warn!(?status, "Landlock partially enforced"),
+            RulesetStatus::NotEnforced => bail!("Landlock is not enforced on this system: {:?}", status),
+        }
+    } else {
+        tracing::info!("Landlock disabled (no path restriction arguments provided)");
     }
 
-    if args.allow_nss {
-        info!("adding NSS allowlist");
-        add_allow_nss(&mut allow, access_ro).context("failed to add NSS allowlist")?;
-    }
 
-    if matches!(args.log_level, LogLevel::Debug) {
-        debug_dump_allowlist(&allow);
-    }
-
-    // Build + enforce the Landlock ruleset.
-    info!(entries = allow.len(), "enforcing Landlock ruleset");
-    let status = enforce_landlock(abi, &allow).context("failed to enforce Landlock")?;
-    match status.ruleset {
-        RulesetStatus::FullyEnforced => {
-            info!("Landlock fully enforced");
-        }
-        RulesetStatus::PartiallyEnforced => {
-            warn!(?status, "Landlock is only partially enforced (best-effort fallback)");
-        }
-        RulesetStatus::NotEnforced => {
-            bail!("Landlock is not enforced on this system: {:?}", status);
-        }
-    }
-
-    // Optional hardening layers (must happen before dropping uid/gid).
-    if args.drop_caps || args.seccomp_mount {
+    // no_new_privs prevents gaining privilege via exec (setuid/setgid/filecaps).
+    // Keep it ON by default; allow opting out for helpers like fusermount3/sshfs.
+    if args.allow_new_privs {
+        info!("--allow-new-privs set: not setting no_new_privs; setuid/filecaps may work inside the child");
+    } else {
+        info!("setting no_new_privs");
         set_no_new_privs().context("failed to set no_new_privs")?;
     }
 
@@ -262,9 +350,9 @@ fn run(args: Args) -> Result<()> {
         drop_caps().context("failed to drop capabilities")?;
     }
 
-    if args.seccomp_mount {
-        info!("installing seccomp mount filter");
-        install_seccomp_mount().context("failed to install seccomp mount filter")?;
+    if !args.seccomp_filter.is_empty() {
+        install_seccomp_from_lists_and_names(&args.seccomp_filter, &args.seccomp_allow)
+            .context("failed to install seccomp filter")?;
     }
 
     // Drop privileges (if requested) AFTER Landlock is enforced.
@@ -275,6 +363,7 @@ fn run(args: Args) -> Result<()> {
 
     // Exec the target.
     info!(cmd = %cmd_path.display(), "exec");
+    close_fds_before_exec().context("failed to close inherited fds")?;
     execv(&cmd_path, &cmd_argv)
 }
 
@@ -760,6 +849,45 @@ fn drop_privileges(info_u: &UserInfo) -> Result<()> {
     Ok(())
 }
 
+fn close_fds_before_exec() -> Result<()> {
+    // Close everything except stdin/stdout/stderr.
+    let first: libc::c_uint = 3;
+    let last: libc::c_uint = !0u32; // ~0U
+
+    // Avoid races if the process ever becomes multithreaded / shares fd table.
+    // (Equivalent conceptually to unshare(CLONE_FILES) + close_range, but more efficient.)
+    let flags: libc::c_uint = libc::CLOSE_RANGE_UNSHARE as libc::c_uint;
+
+    let rc = unsafe { libc::close_range(first, last, flags as libc::c_int) };
+    if rc == 0 {
+        return Ok(());
+    }
+
+    let e = std::io::Error::last_os_error();
+
+    // Old kernel => ENOSYS: close_range not supported (Linux added it in 5.9)
+    if e.raw_os_error() == Some(libc::ENOSYS) {
+        // Fallback: brute-force close from 3..RLIMIT_NOFILE
+        let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("getrlimit(RLIMIT_NOFILE) failed");
+        }
+
+        let max_fd = if lim.rlim_cur == libc::RLIM_INFINITY {
+            1_048_576u64
+        } else {
+            lim.rlim_cur as u64
+        };
+
+        for fd in 3..(max_fd as libc::c_int) {
+            unsafe { libc::close(fd) };
+        }
+        return Ok(());
+    }
+
+    Err(e).context("close_range failed")
+}
+
 fn execv(cmd: &Path, argv: &[OsString]) -> Result<()> {
     let cmd_c = CString::new(cmd.as_os_str().as_bytes())
         .with_context(|| format!("command path contains NUL: {}", cmd.display()))?;
@@ -915,47 +1043,116 @@ fn clear_capsets() -> Result<()> {
     Ok(())
 }
 
-fn install_seccomp_mount() -> Result<()> {
-    // Default: allow everything, deny a small set.
+fn expand_seccomp_items(items: &[String]) -> Result<HashSet<String>> {
+    let mut out: HashSet<String> = HashSet::new();
+
+    for item in items {
+        if let Some(list_name) = item.strip_prefix('@') {
+            match list_name {
+                "default" => out.extend(SECCOMP_LIST_DEFAULT.iter().map(|s| (*s).to_string())),
+                "mount" => out.extend(SECCOMP_LIST_MOUNT.iter().map(|s| (*s).to_string())),
+                other => bail!("unknown seccomp list: @{}", other),
+            }
+        } else {
+            out.insert(item.clone());
+        }
+    }
+
+    Ok(out)
+}
+
+fn install_seccomp_from_lists_and_names(filter_items: &[String], allow_items: &[String]) -> Result<()> {
     let mut filter = ScmpFilterContext::new(ScmpAction::Allow)
         .context("ScmpFilterContext::new failed")?;
 
     let deny = ScmpAction::Errno(libc::EPERM);
 
-    // Core mount syscalls + the newer mount API.
-    let syscalls = [
-        "mount",
-        "umount2",
-        "pivot_root",
-        "open_tree",
-        "move_mount",
-        "fsopen",
-        "fsconfig",
-        "fsmount",
-        "mount_setattr",
-    ];
+    let mut blocked = expand_seccomp_items(filter_items)?;
+    let allowed = expand_seccomp_items(allow_items)?;
 
-    for name in syscalls {
-        if let Ok(sc) = ScmpSyscall::from_name(name) {
-            filter
-                .add_rule(deny, sc)
-                .with_context(|| format!("seccomp add_rule({}) failed", name))?;
-        } else {
-            debug!(syscall = name, "seccomp: syscall not available; skipping");
+    // Remove allowed from blocked (including list expansions).
+    for a in &allowed {
+        blocked.remove(a);
+    }
+
+    // Warn about allow items that don’t correspond to any known syscall on this platform.
+    // (Lists are already validated in expand_seccomp_items.)
+    for a in &allowed {
+        if a == "clone" || a == "personality" {
+            continue; // special-cased, may not be a normal add_rule anyway
+        }
+        if ScmpSyscall::from_name(a).is_err() {
+            tracing::warn!(item = a, "seccomp-allow: not a known syscall on this platform (no effect here)");
         }
     }
 
-    // Optional hardening: prevent creating/entering namespaces used for mounting.
-    for name in ["unshare", "setns"] {
-        if let Ok(sc) = ScmpSyscall::from_name(name) {
-            filter
-                .add_rule(deny, sc)
-                .with_context(|| format!("seccomp add_rule({}) failed", name))?;
-        } else {
-            debug!(syscall = name, "seccomp: syscall not available; skipping");
+    // Apply rules (with special behavior for clone/personality).
+    for name in blocked.iter() {
+        match name.as_str() {
+            "clone" => install_clone_namespace_block(&mut filter, deny)
+                .context("failed to install clone namespace block")?,
+            "personality" => install_personality_block(&mut filter, deny)
+                .context("failed to install personality block")?,
+            other => {
+                let Ok(sc) = ScmpSyscall::from_name(other) else {
+                    // Not present on this arch/kernel/libseccomp — skip quietly.
+                    continue;
+                };
+                filter.add_rule(deny, sc)
+                    .with_context(|| format!("seccomp add_rule({}) failed", other))?;
+
+                tracing::debug!(syscall = other, "seccomp: blocked syscall (EPERM)");
+            }
         }
     }
 
     filter.load().context("seccomp load failed")?;
     Ok(())
 }
+
+fn install_clone_namespace_block(filter: &mut ScmpFilterContext, deny: ScmpAction) -> Result<()> {
+    let Ok(clone_sc) = ScmpSyscall::from_name("clone") else {
+        return Ok(()); // syscall not available
+    };
+
+    // Deny clone() when any CLONE_NEW* flag is set in arg0, but allow normal thread clone.
+    let ns_flags: &[u64] = &[
+        libc::CLONE_NEWNS as u64,
+        libc::CLONE_NEWUTS as u64,
+        libc::CLONE_NEWIPC as u64,
+        libc::CLONE_NEWUSER as u64,
+        libc::CLONE_NEWPID as u64,
+        libc::CLONE_NEWNET as u64,
+        libc::CLONE_NEWCGROUP as u64,
+    ];
+
+    for &flag in ns_flags {
+        // Match if (arg0 & flag) == flag
+        let cmp = ScmpArgCompare::new(0, ScmpCompareOp::MaskedEqual(flag), flag);
+        filter.add_rule_conditional(deny, clone_sc, &[cmp])
+            .with_context(|| format!("seccomp add_rule_conditional(clone, flag=0x{:x}) failed", flag))?;
+
+        tracing::debug!(
+            syscall = "clone",
+            flag = format_args!("0x{:x}", flag),
+            "seccomp: blocked clone when namespace flag is set (EPERM)"
+        );
+    }
+
+    Ok(())
+}
+
+fn install_personality_block(filter: &mut ScmpFilterContext, deny: ScmpAction) -> Result<()> {
+    let Ok(pers_sc) = ScmpSyscall::from_name("personality") else {
+        return Ok(()); // syscall not available
+    };
+
+    // Allow personality(0); deny any other value.
+    let cmp = ScmpArgCompare::new(0, ScmpCompareOp::NotEqual, 0);
+    filter.add_rule_conditional(deny, pers_sc, &[cmp])
+        .context("seccomp add_rule_conditional(personality != 0) failed")?;
+
+    tracing::debug!(syscall = "personality", "seccomp: blocked personality(arg0 != 0) (EPERM)");
+    Ok(())
+}
+
