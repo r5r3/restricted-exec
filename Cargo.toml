@@ -14,4 +14,6 @@ landlock = "0.4"
 libc = "0.2"
 goblin = "0.10"
 libseccomp = "0.4.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

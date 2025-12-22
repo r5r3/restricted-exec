@@ -4,18 +4,31 @@ use landlock::{
     make_bitflags, Access, AccessFs, BitFlags, PathBeneath, PathFd, Ruleset, RulesetAttr,
     RulesetCreatedAttr, RulesetStatus, ABI,
 };
+use libseccomp::{ScmpAction, ScmpFilterContext, ScmpSyscall};
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, OsString};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
-use libseccomp::{ScmpAction, ScmpFilterContext, ScmpSyscall};
 
+use tracing::{debug, error, info, warn};
+use tracing_subscriber::EnvFilter;
 
 const DEFAULT_LIB_DIRS: [&str; 6] = [
-    "/lib", "/lib64", "/usr/lib", "/usr/lib64", "/usr/local/lib", "/usr/local/lib64",
+    "/lib",
+    "/lib64",
+    "/usr/lib",
+    "/usr/lib64",
+    "/usr/local/lib",
+    "/usr/local/lib64",
 ];
 const LD_SO_PATHS: [&str; 3] = ["/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d"];
 
+#[derive(clap::ValueEnum, Debug, Clone, Copy)]
+enum LogLevel {
+    Warn,
+    Info,
+    Debug,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -64,9 +77,9 @@ struct Args {
     #[arg(long)]
     seccomp_mount: bool,
 
-    /// Print the final allowlist (paths + rights) before enforcing Landlock.
-    #[arg(long)]
-    debug: bool,
+    /// Log level for restricted-exec (warn, info, debug). Can still be overridden by RUST_LOG.
+    #[arg(long, value_enum, default_value_t = LogLevel::Warn)]
+    log_level: LogLevel,
 
     /// Command to execute (use `--` to separate it from launcher options).
     #[arg(value_name = "CMD", required = true)]
@@ -81,9 +94,36 @@ struct UserInfo {
     groups: Vec<libc::gid_t>,
 }
 
-fn main() -> Result<()> {
-    let args = Args::parse();
+fn init_tracing(level: LogLevel) {
+    let default_level = match level {
+        LogLevel::Warn => "warn",
+        LogLevel::Info => "info",
+        LogLevel::Debug => "debug",
+    };
 
+    // Prefer RUST_LOG if set; otherwise use --log-level.
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
+
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(false)
+        .init();
+}
+
+fn main() {
+    let args = Args::parse();
+    init_tracing(args.log_level);
+
+    if let Err(e) = run(args) {
+        // Print the full anyhow chain in one log record.
+        error!("restricted-exec failed:");
+        error!(error = %format!("{:#}", e));
+        std::process::exit(1);
+    }
+}
+
+fn run(args: Args) -> Result<()> {
     // Resolve --user (do NSS lookups before Landlock is enforced).
     let user_info = match &args.user {
         Some(u) => Some(resolve_user(u).context("failed to resolve --user")?),
@@ -93,6 +133,8 @@ fn main() -> Result<()> {
     // Resolve the command path (and rewrite argv[0] to an absolute/canonical path when possible).
     let (cmd_path, cmd_argv) = resolve_command(&args.cmd)
         .with_context(|| format!("failed to resolve command {:?}", args.cmd.get(0)))?;
+
+    debug!(cmd = %cmd_path.display(), argc = cmd_argv.len(), "resolved command");
 
     // Choose an ABI "ceiling". Best-effort will degrade on older kernels by default.
     let abi = ABI::V6;
@@ -132,6 +174,7 @@ fn main() -> Result<()> {
 
     // If it's a script with #! shebang, allow executing the interpreter too.
     if let Some(interp) = shebang_interpreter(&cmd_path)? {
+        debug!(interp = %interp.display(), "detected shebang interpreter");
         add_allow_path(
             &mut allow,
             interp,
@@ -142,6 +185,7 @@ fn main() -> Result<()> {
 
     // --default-libs: add a minimal set of common glibc/ld.so locations.
     if args.default_libs {
+        info!("adding default library paths");
         for p in DEFAULT_LIB_DIRS {
             add_allow_path(&mut allow, PathBuf::from(p), access_rox, false)?;
         }
@@ -151,10 +195,12 @@ fn main() -> Result<()> {
     }
 
     if args.resolve_libs {
+        info!("resolving used shared objects (ldd-style trace)");
         let (trace_prog, trace_argv) = build_trace_command(&cmd_path, &cmd_argv)?;
 
         // 1) Allow the ELF interpreter for the traced program (dynamic loader), if any.
         if let Some(interp) = elf_interpreter(&trace_prog)? {
+            debug!(loader = %interp.display(), "ELF interpreter (dynamic loader)");
             add_allow_path(
                 &mut allow,
                 interp,
@@ -171,6 +217,7 @@ fn main() -> Result<()> {
             add_allow_path(&mut allow, PathBuf::from(p), access_ro, false)?;
         }
 
+        debug!(count = used.len(), "resolved shared object paths");
         for so in used {
             add_allow_path(
                 &mut allow,
@@ -182,22 +229,23 @@ fn main() -> Result<()> {
     }
 
     if args.allow_nss {
+        info!("adding NSS allowlist");
         add_allow_nss(&mut allow, access_ro).context("failed to add NSS allowlist")?;
     }
 
-    if args.debug {
+    if matches!(args.log_level, LogLevel::Debug) {
         debug_dump_allowlist(&allow);
     }
 
     // Build + enforce the Landlock ruleset.
+    info!(entries = allow.len(), "enforcing Landlock ruleset");
     let status = enforce_landlock(abi, &allow).context("failed to enforce Landlock")?;
     match status.ruleset {
-        RulesetStatus::FullyEnforced => {}
+        RulesetStatus::FullyEnforced => {
+            info!("Landlock fully enforced");
+        }
         RulesetStatus::PartiallyEnforced => {
-            eprintln!(
-                "warning: Landlock is only partially enforced (best-effort fallback): {:?}",
-                status
-            );
+            warn!(?status, "Landlock is only partially enforced (best-effort fallback)");
         }
         RulesetStatus::NotEnforced => {
             bail!("Landlock is not enforced on this system: {:?}", status);
@@ -210,19 +258,23 @@ fn main() -> Result<()> {
     }
 
     if args.drop_caps {
+        info!("dropping capabilities");
         drop_caps().context("failed to drop capabilities")?;
     }
 
     if args.seccomp_mount {
+        info!("installing seccomp mount filter");
         install_seccomp_mount().context("failed to install seccomp mount filter")?;
     }
 
     // Drop privileges (if requested) AFTER Landlock is enforced.
-    if let Some(info) = user_info {
-        drop_privileges(&info).context("failed to drop privileges")?;
+    if let Some(info_u) = user_info {
+        info!(uid = info_u.uid, gid = info_u.gid, "dropping privileges");
+        drop_privileges(&info_u).context("failed to drop privileges")?;
     }
 
     // Exec the target.
+    info!(cmd = %cmd_path.display(), "exec");
     execv(&cmd_path, &cmd_argv)
 }
 
@@ -257,16 +309,18 @@ fn resolve_used_shared_objects(prog: &Path, argv: &[OsString]) -> Result<Vec<Pat
     let mut cmd = std::process::Command::new(prog);
     cmd.args(&argv[1..]);
     cmd.env("LD_TRACE_LOADED_OBJECTS", "1");
-    // Optional but often useful to avoid surprises:
-    // cmd.env("LD_BIND_NOW", "1");
 
-    let out = cmd.output().with_context(|| format!("failed to execute trace for {}", prog.display()))?;
+    let out = cmd
+        .output()
+        .with_context(|| format!("failed to execute trace for {}", prog.display()))?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let stdout = String::from_utf8_lossy(&out.stdout);
         bail!(
             "library trace failed (exit {}):\nstdout:\n{}\nstderr:\n{}",
-            out.status, stdout, stderr
+            out.status,
+            stdout,
+            stderr
         );
     }
 
@@ -372,15 +426,13 @@ fn add_allow_path(
         std::fs::metadata(&path)
             .with_context(|| format!("path does not exist: {}", path.display()))?;
     } else if std::fs::metadata(&path).is_err() {
-        // best-effort: ignore missing paths (e.g. optional --libs entries)
+        debug!(path = %path.display(), "optional allow-path missing; skipping");
         return Ok(());
     }
 
     let p = normalize_path(&path);
-
     // Add the path itself (merged).
-    merge_allow(map, p.clone(), access);
-
+    merge_allow(map, p, access);
     Ok(())
 }
 
@@ -456,15 +508,18 @@ fn add_allow_nss(
 }
 
 fn debug_dump_allowlist(allow: &BTreeMap<PathBuf, BitFlags<AccessFs>>) {
-    eprintln!("restricted-exec: allowed paths ({} entries):", allow.len());
+    debug!(entries = allow.len(), "allowed paths");
     for (p, a) in allow.iter() {
-        eprintln!("  {:?}  {}", a, p.display());
+        debug!(access = ?a, path = %p.display());
     }
 }
 
-fn enforce_landlock(abi: ABI, allow: &BTreeMap<PathBuf, BitFlags<AccessFs>>) -> Result<landlock::RestrictionStatus> {
     // Handle all filesystem rights defined by the chosen ABI ceiling.
     // Anything not explicitly allowed by rules will be denied for handled rights.
+fn enforce_landlock(
+    abi: ABI,
+    allow: &BTreeMap<PathBuf, BitFlags<AccessFs>>,
+) -> Result<landlock::RestrictionStatus> {
     let handled = AccessFs::from_all(abi);
 
     let ruleset = Ruleset::default()
@@ -501,10 +556,7 @@ fn build_path_rule(path: &Path, access: BitFlags<AccessFs>, abi: ABI) -> Result<
 }
 
 fn resolve_command(cmd: &[OsString]) -> Result<(PathBuf, Vec<OsString>)> {
-    let arg0 = cmd
-        .get(0)
-        .ok_or_else(|| anyhow!("missing command"))?
-        .clone();
+    let arg0 = cmd.get(0).ok_or_else(|| anyhow!("missing command"))?.clone();
 
     let has_slash = arg0.as_os_str().as_bytes().contains(&b'/');
     let resolved = if has_slash {
@@ -549,10 +601,7 @@ fn shebang_interpreter(path: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
 
-    let line_end = buf[..n]
-        .iter()
-        .position(|&b| b == b'\n')
-        .unwrap_or(n);
+    let line_end = buf[..n].iter().position(|&b| b == b'\n').unwrap_or(n);
 
     let mut line = &buf[2..line_end];
     while !line.is_empty() && line[0].is_ascii_whitespace() {
@@ -562,11 +611,7 @@ fn shebang_interpreter(path: &Path) -> Result<Option<PathBuf>> {
         return Ok(None);
     }
 
-    let interp = line
-        .split(|b| b.is_ascii_whitespace())
-        .next()
-        .unwrap_or(&[]);
-
+    let interp = line.split(|b| b.is_ascii_whitespace()).next().unwrap_or(&[]);
     if interp.is_empty() {
         return Ok(None);
     }
@@ -607,11 +652,7 @@ fn resolve_user(spec: &str) -> Result<UserInfo> {
 fn pw_buf_size() -> usize {
     // Fallback if sysconf returns indeterminate.
     let n = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
-    if n <= 0 {
-        16384
-    } else {
-        n as usize
-    }
+    if n <= 0 { 16384 } else { n as usize }
 }
 
 fn passwd_by_name(name: &CString) -> Result<(libc::uid_t, libc::gid_t)> {
@@ -673,14 +714,7 @@ fn supplementary_groups(user: &CString, primary_gid: libc::gid_t) -> Result<Vec<
 
     loop {
         let mut n = ngroups;
-        let rc = unsafe {
-            libc::getgrouplist(
-                user.as_ptr(),
-                primary_gid,
-                groups.as_mut_ptr(),
-                &mut n,
-            )
-        };
+        let rc = unsafe { libc::getgrouplist(user.as_ptr(), primary_gid, groups.as_mut_ptr(), &mut n) };
 
         if rc >= 0 {
             groups.truncate(n as usize);
@@ -698,18 +732,28 @@ fn supplementary_groups(user: &CString, primary_gid: libc::gid_t) -> Result<Vec<
     }
 }
 
-fn drop_privileges(info: &UserInfo) -> Result<()> {
-    // Apply supplementary groups before dropping uid.
-    let rc = unsafe { libc::setgroups(info.groups.len(), info.groups.as_ptr()) };
+fn drop_privileges(info_u: &UserInfo) -> Result<()> {
+    // log user info
+    let name = info_u.name.to_string_lossy();
+    debug!(
+        name = %name,
+        uid = info_u.uid,
+        gid = info_u.gid,
+        groups = ?info_u.groups,
+        "dropping to user"
+    );
+
+    // Set group memberships. 
+    let rc = unsafe { libc::setgroups(info_u.groups.len(), info_u.groups.as_ptr()) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error()).context("setgroups failed");
     }
 
     // Set real/effective/saved IDs to prevent regaining privilege.
-    if unsafe { libc::setresgid(info.gid, info.gid, info.gid) } != 0 {
+    if unsafe { libc::setresgid(info_u.gid, info_u.gid, info_u.gid) } != 0 {
         return Err(std::io::Error::last_os_error()).context("setresgid failed");
     }
-    if unsafe { libc::setresuid(info.uid, info.uid, info.uid) } != 0 {
+    if unsafe { libc::setresuid(info_u.uid, info_u.uid, info_u.uid) } != 0 {
         return Err(std::io::Error::last_os_error()).context("setresuid failed");
     }
 
@@ -722,27 +766,19 @@ fn execv(cmd: &Path, argv: &[OsString]) -> Result<()> {
 
     let mut c_argv: Vec<CString> = Vec::with_capacity(argv.len());
     for a in argv {
-        let c = CString::new(a.as_os_str().as_bytes())
-            .context("argument contains NUL byte")?;
+        let c = CString::new(a.as_os_str().as_bytes()).context("argument contains NUL byte")?;
         c_argv.push(c);
     }
 
-    // execv expects *const *const c_char
-    let mut ptrs: Vec<*const libc::c_char> = c_argv
-        .iter()
-        .map(|s| s.as_ptr() as *const libc::c_char)
-        .collect();
+    let mut ptrs: Vec<*const libc::c_char> = c_argv.iter().map(|s| s.as_ptr()).collect();
     ptrs.push(std::ptr::null());
 
-    unsafe {
-        libc::execv(cmd_c.as_ptr(), ptrs.as_ptr());
-    }
+    unsafe { libc::execv(cmd_c.as_ptr(), ptrs.as_ptr()) };
 
     Err(std::io::Error::last_os_error()).context("execv failed")
 }
 
 fn set_no_new_privs() -> Result<()> {
-    // PR_SET_NO_NEW_PRIVS = 38 on Linux; libc usually defines it.
     let rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error()).context("prctl(PR_SET_NO_NEW_PRIVS) failed");
@@ -778,16 +814,12 @@ fn have_cap_in_effective(cap: u32) -> Result<bool> {
     }
 
     let mut hdr = CapHeader { version: LINUX_CAPABILITY_VERSION_3, pid: 0 };
-    let mut data = [CapData { effective: 0, permitted: 0, inheritable: 0 },
-                    CapData { effective: 0, permitted: 0, inheritable: 0 }];
+    let mut data = [
+        CapData { effective: 0, permitted: 0, inheritable: 0 },
+        CapData { effective: 0, permitted: 0, inheritable: 0 },
+    ];
 
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_capget,
-            &mut hdr as *mut CapHeader,
-            data.as_mut_ptr(),
-        )
-    };
+    let rc = unsafe { libc::syscall(libc::SYS_capget, &mut hdr as *mut CapHeader, data.as_mut_ptr()) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error()).context("SYS_capget failed");
     }
@@ -803,7 +835,7 @@ fn have_cap_in_effective(cap: u32) -> Result<bool> {
 fn drop_caps() -> Result<()> {
     const CAP_SETPCAP: u32 = 8;
 
-    // 2) Clear ambient caps (best-effort; older kernels may ENOSYS). :contentReference[oaicite:1]{index=1}
+    // Clear ambient caps (best-effort; older kernels may ENOSYS).
     let rc = unsafe {
         libc::prctl(
             libc::PR_CAP_AMBIENT,
@@ -816,16 +848,18 @@ fn drop_caps() -> Result<()> {
         if e.raw_os_error() != Some(libc::ENOSYS) {
             return Err(e).context("prctl(PR_CAP_AMBIENT_CLEAR_ALL) failed");
         }
+        debug!("PR_CAP_AMBIENT_CLEAR_ALL not supported (ENOSYS); continuing");
     }
 
-    // 3) Clear effective/permitted/inheritable sets for self.
+    // Clear effective/permitted/inheritable sets for self.
     clear_capsets().context("capset clear failed")?;
 
-    // 1) Drop bounding-set caps only if we have CAP_SETPCAP; otherwise skip with warning.
-    // PR_CAPBSET_DROP requires CAP_SETPCAP. :contentReference[oaicite:2]{index=2}
+    // Drop bounding-set caps only if we have CAP_SETPCAP; otherwise skip with warning.
     let can_drop_bset = have_cap_in_effective(CAP_SETPCAP)?;
     if !can_drop_bset {
-        eprintln!("warning: --drop-caps: CAP_SETPCAP not in effective set; skipping PR_CAPBSET_DROP (bounding set)");
+        warn!(
+            "--drop-caps: CAP_SETPCAP not in effective set; skipping PR_CAPBSET_DROP (bounding set)"
+        );
         return Ok(());
     }
 
@@ -836,9 +870,9 @@ fn drop_caps() -> Result<()> {
             let e = std::io::Error::last_os_error();
             // If we lost CAP_SETPCAP mid-way (or policy blocks it), stop and warn.
             if e.raw_os_error() == Some(libc::EPERM) {
-                eprintln!(
-                    "warning: --drop-caps: PR_CAPBSET_DROP({}) EPERM; stopping bounding-set drops",
-                    cap
+                warn!(
+                    cap,
+                    "--drop-caps: PR_CAPBSET_DROP EPERM; stopping bounding-set drops"
                 );
                 break;
             }
@@ -851,7 +885,7 @@ fn drop_caps() -> Result<()> {
 
 fn clear_capsets() -> Result<()> {
     // Linux capability API v3 (64-bit caps in data[0] and data[1])
-    const _LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
+    const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
 
     #[repr(C)]
     struct __user_cap_header_struct {
@@ -867,25 +901,13 @@ fn clear_capsets() -> Result<()> {
         inheritable: u32,
     }
 
-    let mut hdr = __user_cap_header_struct {
-        version: _LINUX_CAPABILITY_VERSION_3,
-        pid: 0, // self
-    };
-
+    let mut hdr = __user_cap_header_struct { version: LINUX_CAPABILITY_VERSION_3, pid: 0 };
     let data = [
         __user_cap_data_struct { effective: 0, permitted: 0, inheritable: 0 },
         __user_cap_data_struct { effective: 0, permitted: 0, inheritable: 0 },
     ];
 
-    // capset is a syscall; use libc::syscall. :contentReference[oaicite:9]{index=9}
-    let rc = unsafe {
-        libc::syscall(
-            libc::SYS_capset,
-            &mut hdr as *mut __user_cap_header_struct,
-            data.as_ptr(),
-        )
-    };
-
+    let rc = unsafe { libc::syscall(libc::SYS_capset, &mut hdr as *mut __user_cap_header_struct, data.as_ptr()) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error()).context("SYS_capset failed");
     }
@@ -901,7 +923,6 @@ fn install_seccomp_mount() -> Result<()> {
     let deny = ScmpAction::Errno(libc::EPERM);
 
     // Core mount syscalls + the newer mount API.
-    // (This is intentionally minimal; add more if you want tighter sandboxing.)
     let syscalls = [
         "mount",
         "umount2",
@@ -916,20 +937,25 @@ fn install_seccomp_mount() -> Result<()> {
 
     for name in syscalls {
         if let Ok(sc) = ScmpSyscall::from_name(name) {
-            filter.add_rule(deny, sc).with_context(|| format!("seccomp add_rule({}) failed", name))?;
+            filter
+                .add_rule(deny, sc)
+                .with_context(|| format!("seccomp add_rule({}) failed", name))?;
+        } else {
+            debug!(syscall = name, "seccomp: syscall not available; skipping");
         }
-        // If a syscall doesn't exist on this arch/kernel, just skip it.
     }
 
     // Optional hardening: prevent creating/entering namespaces used for mounting.
     for name in ["unshare", "setns"] {
         if let Ok(sc) = ScmpSyscall::from_name(name) {
-            filter.add_rule(deny, sc).with_context(|| format!("seccomp add_rule({}) failed", name))?;
+            filter
+                .add_rule(deny, sc)
+                .with_context(|| format!("seccomp add_rule({}) failed", name))?;
+        } else {
+            debug!(syscall = name, "seccomp: syscall not available; skipping");
         }
     }
 
     filter.load().context("seccomp load failed")?;
     Ok(())
 }
-
-
