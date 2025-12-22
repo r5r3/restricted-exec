@@ -241,8 +241,8 @@ fn run(args: Args) -> Result<()> {
 
     debug!(cmd = %cmd_path.display(), argc = cmd_argv.len(), "resolved command");
 
-    let mut allow: BTreeMap<PathBuf, BitFlags<AccessFs>> = BTreeMap::new();
-    if landlock_requested(&args) {
+    let do_landlock = landlock_requested(&args);
+    if do_landlock {
         // Choose an ABI "ceiling".
         let abi = ABI::V6;
 
@@ -250,6 +250,9 @@ fn run(args: Args) -> Result<()> {
         let access_rox: BitFlags<AccessFs> = access_ro | AccessFs::Execute;
         let access_rw: BitFlags<AccessFs> = access_ro | AccessFs::from_write(abi);
         let access_rwx: BitFlags<AccessFs> = access_rw | AccessFs::Execute;
+
+        // list of all allowed paths
+        let mut allow: BTreeMap<PathBuf, BitFlags<AccessFs>> = BTreeMap::new();
 
         // User-specified rules must exist.
         for p in args.ro.clone() {
@@ -339,7 +342,11 @@ fn run(args: Args) -> Result<()> {
     // no_new_privs prevents gaining privilege via exec (setuid/setgid/filecaps).
     // Keep it ON by default; allow opting out for helpers like fusermount3/sshfs.
     if args.allow_new_privs {
-        info!("--allow-new-privs set: not setting no_new_privs; setuid/filecaps may work inside the child");
+        if do_landlock {
+            warn!("--allow-new-privs ignored, because landlock is used!");
+        } else {
+            info!("--allow-new-privs set: not setting no_new_privs; setuid/filecaps may work inside the child");
+        }
     } else {
         info!("setting no_new_privs");
         set_no_new_privs().context("failed to set no_new_privs")?;
