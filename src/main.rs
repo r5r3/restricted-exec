@@ -2,7 +2,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use clap::{ArgAction, Parser};
 use landlock::{
     make_bitflags, Access, AccessFs, BitFlags, PathBeneath, PathFd, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, RulesetStatus, ABI,
+    RulesetCreatedAttr, RulesetStatus, ABI, AccessNet, NetPort, Scope
 };
 use libseccomp::{ScmpAction, ScmpArgCompare, ScmpCompareOp, ScmpFilterContext, ScmpSyscall};
 use std::collections::BTreeMap;
@@ -149,6 +149,30 @@ struct Args {
     #[arg(long)]
     allow_nss: bool,
 
+    /// Allow outgoing TCP connects to these destination ports (Landlock ABI v4+).
+    /// Repeatable: --net-allow-port 443 --net-allow-port 22
+    #[arg(long, value_name = "PORT", action = ArgAction::Append)]
+    net_allow_port: Vec<u16>,
+
+    /// Allow binding TCP sockets to these local ports (Landlock ABI v4+).
+    /// Repeatable: --net-allow-bind 8080 --net-allow-bind 0
+    /// Note: port 0 allows binding to the ephemeral range (ip_local_port_range).
+    #[arg(long, value_name = "PORT", action = ArgAction::Append)]
+    net_allow_bind: Vec<u16>,
+
+    /// Deny all outgoing TCP connect() (Landlock). Equivalent to handling ConnectTcp with no allowed ports.
+    #[arg(long)]
+    net_deny_connect: bool,
+
+    /// Deny all TCP bind() (Landlock). Equivalent to handling BindTcp with no allowed ports.
+    #[arg(long)]
+    net_deny_bind: bool,
+
+    /// Scope abstract UNIX sockets: deny connecting to abstract UDS created outside this Landlock domain
+    /// (Landlock ABI v6+).
+    #[arg(long)]
+    scope_abstract_unix_socket: bool,
+
     /// Drop Linux capabilities (bounding set + ambient + effective/permitted/inheritable).
     #[arg(long)]
     drop_caps: bool,
@@ -214,6 +238,11 @@ fn landlock_requested(args: &Args) -> bool {
         || args.default_libs
         || args.resolve_libs
         || args.allow_nss
+        || !args.net_allow_port.is_empty()
+        || !args.net_allow_bind.is_empty()
+        || args.net_deny_connect
+        || args.net_deny_bind
+        || args.scope_abstract_unix_socket
 }
 
 fn main() {
@@ -327,8 +356,24 @@ fn run(args: Args) -> Result<()> {
         }
 
         // Enforce Landlock *only* when requested.
-        tracing::info!(entries = allow.len(), "enforcing Landlock ruleset");
-        let status = enforce_landlock(abi, &allow).context("failed to enforce Landlock")?;
+        tracing::info!(
+            entries = allow.len(),
+            connect_ports = args.net_allow_port.len(),
+            bind_ports = args.net_allow_bind.len(),
+            deny_connect = args.net_deny_connect,
+            deny_bind = args.net_deny_bind,
+            scope_abstract_unix_socket = args.scope_abstract_unix_socket,
+            "enforcing Landlock ruleset"
+        );
+        let status = enforce_landlock(
+            abi,
+            &allow,
+            &args.net_allow_port,
+            &args.net_allow_bind,
+            args.net_deny_connect,
+            args.net_deny_bind,
+            args.scope_abstract_unix_socket,
+        ).context("failed to enforce Landlock")?;
         match status.ruleset {
             RulesetStatus::FullyEnforced => tracing::info!("Landlock fully enforced"),
             RulesetStatus::PartiallyEnforced => tracing::warn!(?status, "Landlock partially enforced"),
@@ -610,25 +655,80 @@ fn debug_dump_allowlist(allow: &BTreeMap<PathBuf, BitFlags<AccessFs>>) {
     }
 }
 
-    // Handle all filesystem rights defined by the chosen ABI ceiling.
-    // Anything not explicitly allowed by rules will be denied for handled rights.
 fn enforce_landlock(
     abi: ABI,
-    allow: &BTreeMap<PathBuf, BitFlags<AccessFs>>,
+    allow_fs: &BTreeMap<PathBuf, BitFlags<AccessFs>>,
+    allow_connect_tcp_ports: &[u16],
+    allow_bind_tcp_ports: &[u16],
+    deny_connect: bool,
+    deny_bind: bool,
+    scope_abstract_unix_socket: bool,
 ) -> Result<landlock::RestrictionStatus> {
-    let handled = AccessFs::from_all(abi);
+    let mut ruleset = Ruleset::default();
 
-    let ruleset = Ruleset::default()
-        .handle_access(handled)
-        .context("handle_access failed")?
-        .create()
-        .context("ruleset create failed")?;
+    // --- FS handled rights (deny-by-default for handled rights) ---
+    if !allow_fs.is_empty() {
+        let handled_fs = AccessFs::from_all(abi);
+        ruleset = ruleset
+            .handle_access(handled_fs)
+            .context("handle_access(fs) failed")?;
+    }
 
-    let ruleset = ruleset.add_rules(allow.iter().map(|(p, a)| {
-        build_path_rule(p, *a, abi).with_context(|| format!("failed to build rule for {}", p.display()))
-    }))?;
+    // --- Network handled rights (TCP only, by port) ---
+    // “deny all connect/bind” is: handle the right, add no allow rules.
+    if deny_connect
+        || deny_bind
+        || !allow_connect_tcp_ports.is_empty()
+        || !allow_bind_tcp_ports.is_empty()
+    {
+        let mut handled_net = BitFlags::<AccessNet>::EMPTY;
 
-    let status = ruleset.restrict_self().context("restrict_self failed")?;
+        if deny_connect || !allow_connect_tcp_ports.is_empty() {
+            debug!("handling TCP connect");
+            handled_net |= AccessNet::ConnectTcp;
+        }
+        if deny_bind || !allow_bind_tcp_ports.is_empty() {
+            debug!("handling TCP bind");
+            handled_net |= AccessNet::BindTcp;
+        }
+
+        ruleset = ruleset
+            .handle_access(handled_net)
+            .context("handle_access(net) failed")?;
+    }
+
+    // --- IPC scoping: abstract UNIX sockets ---
+    if scope_abstract_unix_socket {
+        debug!("scoping abstract unix sockets");
+        ruleset = ruleset
+            .scope(Scope::AbstractUnixSocket)
+            .context("scope(AbstractUnixSocket) failed")?;
+    }
+
+    let mut created = ruleset.create().context("ruleset create failed")?;
+
+    // FS allow rules
+    if !allow_fs.is_empty() {
+        for (p, a) in allow_fs.iter() {
+            let rule = build_path_rule(p, *a, abi)
+                .with_context(|| format!("failed to build rule for {}", p.display()))?;
+            created = created.add_rule(rule)?;
+        }
+    }
+
+    // TCP connect allow rules
+    for port in allow_connect_tcp_ports {
+        debug!("allowing TCP connect to port {port}");
+        created = created.add_rule(NetPort::new(*port, AccessNet::ConnectTcp))?;
+    }
+
+    // TCP bind allow rules
+    for port in allow_bind_tcp_ports {
+        debug!("allowing TCP bind to port {port}");
+        created = created.add_rule(NetPort::new(*port, AccessNet::BindTcp))?;
+    }
+
+    let status = created.restrict_self().context("restrict_self failed")?;
     Ok(status)
 }
 
