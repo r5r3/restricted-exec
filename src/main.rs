@@ -957,23 +957,31 @@ fn drop_privileges(info_u: &UserInfo) -> Result<()> {
 }
 
 fn close_fds_before_exec() -> Result<()> {
-    // Close everything except stdin/stdout/stderr.
     let first: libc::c_uint = 3;
-    let last: libc::c_uint = !0u32; // ~0U
+    let last: libc::c_uint = !0u32;
 
-    // Avoid races if the process ever becomes multithreaded / shares fd table.
-    // (Equivalent conceptually to unshare(CLONE_FILES) + close_range, but more efficient.)
-    let flags: libc::c_uint = libc::CLOSE_RANGE_UNSHARE as libc::c_uint;
+    // Prefer unshare optimization if supported by the kernel.
+    let flags_unshare: libc::c_uint = libc::CLOSE_RANGE_UNSHARE as libc::c_uint;
 
-    let rc = unsafe { libc::close_range(first, last, flags as libc::c_int) };
+    // Call the syscall directly to avoid requiring glibc >= 2.34.
+    let rc = unsafe { libc::syscall(libc::SYS_close_range, first, last, flags_unshare) };
     if rc == 0 {
         return Ok(());
     }
 
     let e = std::io::Error::last_os_error();
 
-    // Old kernel => ENOSYS: close_range not supported (Linux added it in 5.9)
-    if e.raw_os_error() == Some(libc::ENOSYS) {
+    // ENOSYS: kernel too old (close_range syscall missing)
+    // EINVAL: syscall exists but flags not supported (e.g. CLOSE_RANGE_UNSHARE not understood)
+    if matches!(e.raw_os_error(), Some(libc::ENOSYS | libc::EINVAL)) {
+        // If only the flag was the problem, try again with flags=0.
+        if e.raw_os_error() == Some(libc::EINVAL) {
+            let rc2 = unsafe { libc::syscall(libc::SYS_close_range, first, last, 0) };
+            if rc2 == 0 {
+                return Ok(());
+            }
+        }
+
         // Fallback: brute-force close from 3..RLIMIT_NOFILE
         let mut lim: libc::rlimit = unsafe { std::mem::zeroed() };
         if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
@@ -992,7 +1000,7 @@ fn close_fds_before_exec() -> Result<()> {
         return Ok(());
     }
 
-    Err(e).context("close_range failed")
+    Err(e).context("close_range syscall failed")
 }
 
 fn execv(cmd: &Path, argv: &[OsString]) -> Result<()> {
