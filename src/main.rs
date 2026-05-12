@@ -271,6 +271,45 @@ fn run(args: Args) -> Result<()> {
     debug!(cmd = %cmd_path.display(), argc = cmd_argv.len(), "resolved command");
 
     let do_landlock = landlock_requested(&args);
+
+    // --- Privilege drop (early) ---
+    //
+    // Drop privileges BEFORE path canonicalization / Landlock setup so that
+    // add_allow_path (and library resolution under --resolve-libs) runs under
+    // the target uid. This is required when allow-listed paths live on a
+    // filesystem that squashes root (e.g. Lustre with root_squash).
+    //
+    // Capability handling depends on whether --user was given:
+    //   * with --user: drop the bounding set first (needs CAP_SETPCAP), then
+    //     drop_privileges. The uid transition automatically clears the
+    //     effective/permitted/inheritable/ambient sets.
+    //   * without --user: keep the original drop_caps() (full clear) — there
+    //     is no uid transition to do the work for us.
+    if let Some(info_u) = user_info.as_ref() {
+        if args.drop_caps {
+            info!("dropping bounding-set capabilities (before user switch)");
+            drop_bounding_set().context("failed to drop bounding-set capabilities")?;
+        }
+        info!(uid = info_u.uid, gid = info_u.gid, "dropping privileges");
+        drop_privileges(info_u).context("failed to drop privileges")?;
+    } else if args.drop_caps {
+        info!("dropping capabilities");
+        drop_caps().context("failed to drop capabilities")?;
+    }
+
+    // no_new_privs must be set BEFORE Landlock enforcement / seccomp when we
+    // are unprivileged (both require CAP_SYS_ADMIN or no_new_privs=1).
+    if args.allow_new_privs && !do_landlock {
+        info!("--allow-new-privs set: not setting no_new_privs; setuid/filecaps may work inside the child");
+    } else {
+        if args.allow_new_privs {
+            warn!("--allow-new-privs ignored, because landlock is used!");
+        } else {
+            info!("setting no_new_privs");
+        }
+        set_no_new_privs().context("failed to set no_new_privs")?;
+    }
+
     if do_landlock {
         // Choose an ABI "ceiling".
         let abi = ABI::V6;
@@ -384,33 +423,9 @@ fn run(args: Args) -> Result<()> {
     }
 
 
-    // no_new_privs prevents gaining privilege via exec (setuid/setgid/filecaps).
-    // Keep it ON by default; allow opting out for helpers like fusermount3/sshfs.
-    if args.allow_new_privs {
-        if do_landlock {
-            warn!("--allow-new-privs ignored, because landlock is used!");
-        } else {
-            info!("--allow-new-privs set: not setting no_new_privs; setuid/filecaps may work inside the child");
-        }
-    } else {
-        info!("setting no_new_privs");
-        set_no_new_privs().context("failed to set no_new_privs")?;
-    }
-
-    if args.drop_caps {
-        info!("dropping capabilities");
-        drop_caps().context("failed to drop capabilities")?;
-    }
-
     if !args.seccomp_filter.is_empty() {
         install_seccomp_from_lists_and_names(&args.seccomp_filter, &args.seccomp_allow)
             .context("failed to install seccomp filter")?;
-    }
-
-    // Drop privileges (if requested) AFTER Landlock is enforced.
-    if let Some(info_u) = user_info {
-        info!(uid = info_u.uid, gid = info_u.gid, "dropping privileges");
-        drop_privileges(&info_u).context("failed to drop privileges")?;
     }
 
     // Exec the target.
@@ -1076,8 +1091,6 @@ fn have_cap_in_effective(cap: u32) -> Result<bool> {
 }
 
 fn drop_caps() -> Result<()> {
-    const CAP_SETPCAP: u32 = 8;
-
     // Clear ambient caps (best-effort; older kernels may ENOSYS).
     let rc = unsafe {
         libc::prctl(
@@ -1097,12 +1110,16 @@ fn drop_caps() -> Result<()> {
     // Clear effective/permitted/inheritable sets for self.
     clear_capsets().context("capset clear failed")?;
 
-    // Drop bounding-set caps only if we have CAP_SETPCAP; otherwise skip with warning.
+    // Drop bounding-set caps (may skip if CAP_SETPCAP was just cleared above).
+    drop_bounding_set()
+}
+
+fn drop_bounding_set() -> Result<()> {
+    const CAP_SETPCAP: u32 = 8;
+
     let can_drop_bset = have_cap_in_effective(CAP_SETPCAP)?;
     if !can_drop_bset {
-        warn!(
-            "--drop-caps: CAP_SETPCAP not in effective set; skipping PR_CAPBSET_DROP (bounding set)"
-        );
+        warn!("CAP_SETPCAP not in effective set; skipping PR_CAPBSET_DROP (bounding set)");
         return Ok(());
     }
 
@@ -1113,10 +1130,7 @@ fn drop_caps() -> Result<()> {
             let e = std::io::Error::last_os_error();
             // If we lost CAP_SETPCAP mid-way (or policy blocks it), stop and warn.
             if e.raw_os_error() == Some(libc::EPERM) {
-                warn!(
-                    cap,
-                    "--drop-caps: PR_CAPBSET_DROP EPERM; stopping bounding-set drops"
-                );
+                warn!(cap, "PR_CAPBSET_DROP EPERM; stopping bounding-set drops");
                 break;
             }
             return Err(e).with_context(|| format!("prctl(PR_CAPBSET_DROP, {}) failed", cap));
