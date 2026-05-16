@@ -1,27 +1,22 @@
-use anyhow::{anyhow, bail, Context, Result};
+use std::{
+    collections::{BTreeMap, HashSet},
+    ffi::{CStr, CString, OsString},
+    os::unix::ffi::{OsStrExt, OsStringExt},
+    path::{Path, PathBuf},
+};
+
+use anyhow::{Context, Result, anyhow, bail};
 use clap::{ArgAction, Parser};
 use landlock::{
-    make_bitflags, Access, AccessFs, BitFlags, PathBeneath, PathFd, Ruleset, RulesetAttr,
-    RulesetCreatedAttr, RulesetStatus, ABI, AccessNet, NetPort, Scope
+    ABI, Access, AccessFs, AccessNet, BitFlags, NetPort, PathBeneath, PathFd, Ruleset, RulesetAttr,
+    RulesetCreatedAttr, RulesetStatus, Scope, make_bitflags,
 };
 use libseccomp::{ScmpAction, ScmpArgCompare, ScmpCompareOp, ScmpFilterContext, ScmpSyscall};
-use std::collections::BTreeMap;
-use std::collections::HashSet;
-use std::ffi::{CStr, CString, OsString};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::path::{Path, PathBuf};
-
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-const DEFAULT_LIB_DIRS: [&str; 6] = [
-    "/lib",
-    "/lib64",
-    "/usr/lib",
-    "/usr/lib64",
-    "/usr/local/lib",
-    "/usr/local/lib64",
-];
+const DEFAULT_LIB_DIRS: [&str; 6] =
+    ["/lib", "/lib64", "/usr/lib", "/usr/lib64", "/usr/local/lib", "/usr/local/lib64"];
 const LD_SO_PATHS: [&str; 3] = ["/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d"];
 
 // Seccomp syscall lists.
@@ -76,7 +71,6 @@ const SECCOMP_LIST_DEFAULT: &[&str] = &[
     "ustat",
     "vm86",
     "vm86old",
-
     // “Docker-like” special-cased rules (conditional deny, not unconditional):
     "clone",
     "personality",
@@ -101,7 +95,6 @@ const SECCOMP_LIST_MOUNT: &[&str] = &[
     // If requested, we apply the *conditional* rule for namespace clone flags:
     "clone",
 ];
-
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy)]
 enum LogLevel {
@@ -205,9 +198,9 @@ struct Args {
 
 #[derive(Debug)]
 struct UserInfo {
-    name: CString,
-    uid: libc::uid_t,
-    gid: libc::gid_t,
+    name:   CString,
+    uid:    libc::uid_t,
+    gid:    libc::gid_t,
     groups: Vec<libc::gid_t>,
 }
 
@@ -222,10 +215,7 @@ fn init_tracing(level: LogLevel) {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_level));
 
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(false)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(filter).with_target(false).init();
 }
 
 fn landlock_requested(args: &Args) -> bool {
@@ -300,7 +290,9 @@ fn run(args: Args) -> Result<()> {
     // no_new_privs must be set BEFORE Landlock enforcement / seccomp when we
     // are unprivileged (both require CAP_SYS_ADMIN or no_new_privs=1).
     if args.allow_new_privs && !do_landlock {
-        info!("--allow-new-privs set: not setting no_new_privs; setuid/filecaps may work inside the child");
+        info!(
+            "--allow-new-privs set: not setting no_new_privs; setuid/filecaps may work inside the child"
+        );
     } else {
         if args.allow_new_privs {
             warn!("--allow-new-privs ignored, because landlock is used!");
@@ -412,16 +404,20 @@ fn run(args: Args) -> Result<()> {
             args.net_deny_connect,
             args.net_deny_bind,
             args.scope_abstract_unix_socket,
-        ).context("failed to enforce Landlock")?;
+        )
+        .context("failed to enforce Landlock")?;
         match status.ruleset {
             RulesetStatus::FullyEnforced => tracing::info!("Landlock fully enforced"),
-            RulesetStatus::PartiallyEnforced => tracing::warn!(?status, "Landlock partially enforced"),
-            RulesetStatus::NotEnforced => bail!("Landlock is not enforced on this system: {:?}", status),
+            RulesetStatus::PartiallyEnforced => {
+                tracing::warn!(?status, "Landlock partially enforced")
+            }
+            RulesetStatus::NotEnforced => {
+                bail!("Landlock is not enforced on this system: {:?}", status)
+            }
         }
     } else {
         tracing::info!("Landlock disabled (no path restriction arguments provided)");
     }
-
 
     if !args.seccomp_filter.is_empty() {
         install_seccomp_from_lists_and_names(&args.seccomp_filter, &args.seccomp_allow)
@@ -449,8 +445,9 @@ fn build_trace_command(cmd_path: &Path, cmd_argv: &[OsString]) -> Result<(PathBu
 }
 
 fn elf_interpreter(path: &Path) -> Result<Option<PathBuf>> {
-    use goblin::elf::Elf;
     use std::fs;
+
+    use goblin::elf::Elf;
 
     let data = fs::read(path)?;
     match Elf::parse(&data) {
@@ -538,9 +535,7 @@ fn merge_allow(
     path: PathBuf,
     access: BitFlags<AccessFs>,
 ) {
-    map.entry(path)
-        .and_modify(|a| *a |= access)
-        .or_insert(access);
+    map.entry(path).and_modify(|a| *a |= access).or_insert(access);
 }
 
 // Lexical normalization for paths that might not exist (does not resolve symlinks).
@@ -620,11 +615,7 @@ fn add_allow_nss(
     // - /var/lib/sss/mc/*: fast memcache files used by libnss_sss unless disabled via
     //   SSS_NSS_USE_MEMCACHE=NO.
     // - /var/lib/sss/pipes/*: responder sockets ("pipes") used for NSS queries.
-    for p in [
-        "/var/lib/sss/mc/passwd",
-        "/var/lib/sss/mc/group",
-        "/var/lib/sss/pipes/nss",
-    ] {
+    for p in ["/var/lib/sss/mc/passwd", "/var/lib/sss/mc/group", "/var/lib/sss/pipes/nss"] {
         add_allow_path(allow, PathBuf::from(p), access_ro, false)?;
     }
 
@@ -684,9 +675,7 @@ fn enforce_landlock(
     // --- FS handled rights (deny-by-default for handled rights) ---
     if !allow_fs.is_empty() {
         let handled_fs = AccessFs::from_all(abi);
-        ruleset = ruleset
-            .handle_access(handled_fs)
-            .context("handle_access(fs) failed")?;
+        ruleset = ruleset.handle_access(handled_fs).context("handle_access(fs) failed")?;
     }
 
     // --- Network handled rights (TCP only, by port) ---
@@ -707,9 +696,7 @@ fn enforce_landlock(
             handled_net |= AccessNet::BindTcp;
         }
 
-        ruleset = ruleset
-            .handle_access(handled_net)
-            .context("handle_access(net) failed")?;
+        ruleset = ruleset.handle_access(handled_net).context("handle_access(net) failed")?;
     }
 
     // --- IPC scoping: abstract UNIX sockets ---
@@ -747,11 +734,15 @@ fn enforce_landlock(
     Ok(status)
 }
 
-fn build_path_rule(path: &Path, access: BitFlags<AccessFs>, abi: ABI) -> Result<PathBeneath<PathFd>> {
+fn build_path_rule(
+    path: &Path,
+    access: BitFlags<AccessFs>,
+    abi: ABI,
+) -> Result<PathBeneath<PathFd>> {
     let meta = std::fs::metadata(path)?;
 
     // If the path is not a directory, keep only file-legal rights.
-    // AccessFs::from_file() is designed exactly for this. 
+    // AccessFs::from_file() is designed exactly for this.
     let mut allowed = access;
     if !meta.is_dir() {
         allowed &= AccessFs::from_file(abi);
@@ -761,7 +752,7 @@ fn build_path_rule(path: &Path, access: BitFlags<AccessFs>, abi: ABI) -> Result<
         bail!("no applicable Landlock rights for {}", path.display());
     }
 
-    // PathFd opens with O_PATH | O_CLOEXEC. 
+    // PathFd opens with O_PATH | O_CLOEXEC.
     let fd = PathFd::new(path)?;
     Ok(PathBeneath::new(fd, allowed))
 }
@@ -829,11 +820,7 @@ fn shebang_interpreter(path: &Path) -> Result<Option<PathBuf>> {
 
     let interp_os = OsString::from_vec(interp.to_vec());
     let interp_path = PathBuf::from(interp_os);
-    if interp_path.is_absolute() {
-        Ok(Some(interp_path))
-    } else {
-        Ok(None)
-    }
+    if interp_path.is_absolute() { Ok(Some(interp_path)) } else { Ok(None) }
 }
 
 fn resolve_user(spec: &str) -> Result<UserInfo> {
@@ -846,12 +833,7 @@ fn resolve_user(spec: &str) -> Result<UserInfo> {
     if let Ok(uid) = spec.parse::<u32>() {
         let (name, gid) = passwd_by_uid(uid as libc::uid_t)?;
         let groups = supplementary_groups(&name, gid)?;
-        Ok(UserInfo {
-            name,
-            uid: uid as libc::uid_t,
-            gid,
-            groups,
-        })
+        Ok(UserInfo { name, uid: uid as libc::uid_t, gid, groups })
     } else {
         let name = CString::new(spec).context("username contains NUL byte")?;
         let (uid, gid) = passwd_by_name(&name)?;
@@ -919,13 +901,14 @@ fn passwd_by_uid(uid: libc::uid_t) -> Result<(CString, libc::gid_t)> {
 }
 
 fn supplementary_groups(user: &CString, primary_gid: libc::gid_t) -> Result<Vec<libc::gid_t>> {
-    // Start with a reasonable buffer and grow if needed. (getgrouplist returns -1 if too small.) 
+    // Start with a reasonable buffer and grow if needed. (getgrouplist returns -1 if too small.)
     let mut ngroups: libc::c_int = 16;
     let mut groups: Vec<libc::gid_t> = vec![0; ngroups as usize];
 
     loop {
         let mut n = ngroups;
-        let rc = unsafe { libc::getgrouplist(user.as_ptr(), primary_gid, groups.as_mut_ptr(), &mut n) };
+        let rc =
+            unsafe { libc::getgrouplist(user.as_ptr(), primary_gid, groups.as_mut_ptr(), &mut n) };
 
         if rc >= 0 {
             groups.truncate(n as usize);
@@ -954,7 +937,7 @@ fn drop_privileges(info_u: &UserInfo) -> Result<()> {
         "dropping to user"
     );
 
-    // Set group memberships. 
+    // Set group memberships.
     let rc = unsafe { libc::setgroups(info_u.groups.len(), info_u.groups.as_ptr()) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error()).context("setgroups failed");
@@ -1003,11 +986,8 @@ fn close_fds_before_exec() -> Result<()> {
             return Err(std::io::Error::last_os_error()).context("getrlimit(RLIMIT_NOFILE) failed");
         }
 
-        let max_fd = if lim.rlim_cur == libc::RLIM_INFINITY {
-            1_048_576u64
-        } else {
-            lim.rlim_cur as u64
-        };
+        let max_fd =
+            if lim.rlim_cur == libc::RLIM_INFINITY { 1_048_576u64 } else { lim.rlim_cur as u64 };
 
         for fd in 3..(max_fd as libc::c_int) {
             unsafe { libc::close(fd) };
@@ -1060,14 +1040,14 @@ fn have_cap_in_effective(cap: u32) -> Result<bool> {
     #[repr(C)]
     struct CapHeader {
         version: u32,
-        pid: i32,
+        pid:     i32,
     }
 
     #[repr(C)]
     #[derive(Copy, Clone)]
     struct CapData {
-        effective: u32,
-        permitted: u32,
+        effective:   u32,
+        permitted:   u32,
         inheritable: u32,
     }
 
@@ -1077,7 +1057,8 @@ fn have_cap_in_effective(cap: u32) -> Result<bool> {
         CapData { effective: 0, permitted: 0, inheritable: 0 },
     ];
 
-    let rc = unsafe { libc::syscall(libc::SYS_capget, &mut hdr as *mut CapHeader, data.as_mut_ptr()) };
+    let rc =
+        unsafe { libc::syscall(libc::SYS_capget, &mut hdr as *mut CapHeader, data.as_mut_ptr()) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error()).context("SYS_capget failed");
     }
@@ -1092,13 +1073,7 @@ fn have_cap_in_effective(cap: u32) -> Result<bool> {
 
 fn drop_caps() -> Result<()> {
     // Clear ambient caps (best-effort; older kernels may ENOSYS).
-    let rc = unsafe {
-        libc::prctl(
-            libc::PR_CAP_AMBIENT,
-            libc::PR_CAP_AMBIENT_CLEAR_ALL,
-            0, 0, 0,
-        )
-    };
+    let rc = unsafe { libc::prctl(libc::PR_CAP_AMBIENT, libc::PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0) };
     if rc != 0 {
         let e = std::io::Error::last_os_error();
         if e.raw_os_error() != Some(libc::ENOSYS) {
@@ -1147,14 +1122,14 @@ fn clear_capsets() -> Result<()> {
     #[repr(C)]
     struct __user_cap_header_struct {
         version: u32,
-        pid: i32,
+        pid:     i32,
     }
 
     #[repr(C)]
     #[derive(Copy, Clone)]
     struct __user_cap_data_struct {
-        effective: u32,
-        permitted: u32,
+        effective:   u32,
+        permitted:   u32,
         inheritable: u32,
     }
 
@@ -1164,7 +1139,9 @@ fn clear_capsets() -> Result<()> {
         __user_cap_data_struct { effective: 0, permitted: 0, inheritable: 0 },
     ];
 
-    let rc = unsafe { libc::syscall(libc::SYS_capset, &mut hdr as *mut __user_cap_header_struct, data.as_ptr()) };
+    let rc = unsafe {
+        libc::syscall(libc::SYS_capset, &mut hdr as *mut __user_cap_header_struct, data.as_ptr())
+    };
     if rc != 0 {
         return Err(std::io::Error::last_os_error()).context("SYS_capset failed");
     }
@@ -1190,9 +1167,12 @@ fn expand_seccomp_items(items: &[String]) -> Result<HashSet<String>> {
     Ok(out)
 }
 
-fn install_seccomp_from_lists_and_names(filter_items: &[String], allow_items: &[String]) -> Result<()> {
-    let mut filter = ScmpFilterContext::new(ScmpAction::Allow)
-        .context("ScmpFilterContext::new failed")?;
+fn install_seccomp_from_lists_and_names(
+    filter_items: &[String],
+    allow_items: &[String],
+) -> Result<()> {
+    let mut filter =
+        ScmpFilterContext::new(ScmpAction::Allow).context("ScmpFilterContext::new failed")?;
 
     let deny = ScmpAction::Errno(libc::EPERM);
 
@@ -1211,7 +1191,10 @@ fn install_seccomp_from_lists_and_names(filter_items: &[String], allow_items: &[
             continue; // special-cased, may not be a normal add_rule anyway
         }
         if ScmpSyscall::from_name(a).is_err() {
-            tracing::warn!(item = a, "seccomp-allow: not a known syscall on this platform (no effect here)");
+            tracing::warn!(
+                item = a,
+                "seccomp-allow: not a known syscall on this platform (no effect here)"
+            );
         }
     }
 
@@ -1227,7 +1210,8 @@ fn install_seccomp_from_lists_and_names(filter_items: &[String], allow_items: &[
                     // Not present on this arch/kernel/libseccomp — skip quietly.
                     continue;
                 };
-                filter.add_rule(deny, sc)
+                filter
+                    .add_rule(deny, sc)
                     .with_context(|| format!("seccomp add_rule({}) failed", other))?;
 
                 tracing::debug!(syscall = other, "seccomp: blocked syscall (EPERM)");
@@ -1258,8 +1242,9 @@ fn install_clone_namespace_block(filter: &mut ScmpFilterContext, deny: ScmpActio
     for &flag in ns_flags {
         // Match if (arg0 & flag) == flag
         let cmp = ScmpArgCompare::new(0, ScmpCompareOp::MaskedEqual(flag), flag);
-        filter.add_rule_conditional(deny, clone_sc, &[cmp])
-            .with_context(|| format!("seccomp add_rule_conditional(clone, flag=0x{:x}) failed", flag))?;
+        filter.add_rule_conditional(deny, clone_sc, &[cmp]).with_context(|| {
+            format!("seccomp add_rule_conditional(clone, flag=0x{:x}) failed", flag)
+        })?;
 
         tracing::debug!(
             syscall = "clone",
@@ -1278,10 +1263,10 @@ fn install_personality_block(filter: &mut ScmpFilterContext, deny: ScmpAction) -
 
     // Allow personality(0); deny any other value.
     let cmp = ScmpArgCompare::new(0, ScmpCompareOp::NotEqual, 0);
-    filter.add_rule_conditional(deny, pers_sc, &[cmp])
+    filter
+        .add_rule_conditional(deny, pers_sc, &[cmp])
         .context("seccomp add_rule_conditional(personality != 0) failed")?;
 
     tracing::debug!(syscall = "personality", "seccomp: blocked personality(arg0 != 0) (EPERM)");
     Ok(())
 }
-
