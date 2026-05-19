@@ -187,6 +187,14 @@ struct Args {
     #[arg(long)]
     allow_new_privs: bool,
 
+    /// Fail if the kernel cannot fully enforce the requested Landlock ruleset.
+    /// Without this flag a `PartiallyEnforced` status (e.g. on a kernel missing
+    /// some of the ABI features used in the policy) is logged at warn level and
+    /// execution continues, silently weakening the sandbox. With this flag the
+    /// launcher exits non-zero in that case. Recommended for production.
+    #[arg(long)]
+    landlock_strict: bool,
+
     /// Log level for restricted-exec (warn, info, debug). Can still be overridden by RUST_LOG.
     #[arg(long, value_enum, default_value_t = LogLevel::Warn)]
     log_level: LogLevel,
@@ -409,7 +417,13 @@ fn run(args: Args) -> Result<()> {
         match status.ruleset {
             RulesetStatus::FullyEnforced => tracing::info!("Landlock fully enforced"),
             RulesetStatus::PartiallyEnforced => {
-                tracing::warn!(?status, "Landlock partially enforced")
+                if args.landlock_strict {
+                    bail!(
+                        "Landlock only partially enforced and --landlock-strict was given: {:?}",
+                        status
+                    );
+                }
+                tracing::warn!(?status, "Landlock partially enforced");
             }
             RulesetStatus::NotEnforced => {
                 bail!("Landlock is not enforced on this system: {:?}", status)
